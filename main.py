@@ -1,219 +1,174 @@
 import os
 import discord
-from discord.ext import tasks
-from discord import app_commands
+from discord.ext import commands, tasks
 import requests
-import json
+import yfinance as yf
 
-# =====================
-# ENV (ใส่ใน Secrets)
-# =====================
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-# =====================
-# Bot setup
-# =====================
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-# user_targets: user_id -> {symbol: {"target": float, "dm": bool}}
-user_targets: dict[str, dict] = {}
-# last_alerts: user_id -> {symbol: message_obj}
-last_alerts: dict[str, dict[str, discord.Message]] = {}
+# user_targets: {user_id: {symbol: target_price}}
+user_targets = {}
+# last_alerts: {user_id: {symbol: message_obj}}
+last_alerts = {}
 
-DATA_FILE = "targets.json"
-
-# =====================
-# Load / Save data
-# =====================
-def load_data():
-    global user_targets
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            user_targets = json.load(f)
-
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(user_targets, f)
-
-# =====================
-# Finnhub API
-# =====================
+# ============ ฟังก์ชันเช็คราคา ============
 def get_stock_price(symbol: str) -> float | None:
-    base_url = "https://finnhub.io/api/v1/quote"
-    try:
-        r = requests.get(f"{base_url}?symbol={symbol}&token={FINNHUB_API_KEY}", timeout=10)
-        data = r.json()
-        if data.get("c"):
-            return data["c"]
-    except Exception:
-        pass
+    if symbol.upper().endswith(".BK"):  # หุ้นไทย
+        try:
+            ticker = yf.Ticker(symbol)
+            price = ticker.history(period="1d")["Close"].iloc[-1]
+            return float(price)
+        except Exception as e:
+            print(f"yfinance error: {e}")
+            return None
+    else:  # หุ้นต่างประเทศ
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            return float(data.get("c", 0)) if data.get("c") else None
+        except Exception as e:
+            print(f"Finnhub error: {e}")
+            return None
 
-    # ถ้าไม่เจอ → ลองต่อท้าย .BK (หุ้นไทย)
-    try:
-        r = requests.get(f"{base_url}?symbol={symbol}.BK&token={FINNHUB_API_KEY}", timeout=10)
-        data = r.json()
-        if data.get("c"):
-            return data["c"]
-    except Exception:
-        pass
+def format_symbol(symbol: str) -> str:
+    s = symbol.upper()
+    if len(s) <= 4 and not s.endswith(".BK"):  # เดาว่าเป็นหุ้นไทย
+        return s + ".BK"
+    return s
 
-    return None
-
-# =====================
-# View with buttons
-# =====================
+# ============ ปุ่มกด ============
 class StockAlertView(discord.ui.View):
     def __init__(self, user_id: int, symbol: str):
         super().__init__(timeout=None)
         self.user_id = user_id
         self.symbol = symbol
 
-    @discord.ui.button(label="🗑 ลบเป้าหมายนี้", style=discord.ButtonStyle.danger)
-    async def remove_target(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ คุณไม่มีสิทธิ์กดปุ่มนี้", ephemeral=True)
-            return
-
-        uid_str = str(self.user_id)
-        if uid_str in user_targets and self.symbol in user_targets[uid_str]:
-            del user_targets[uid_str][self.symbol]
-            save_data()
-            await interaction.response.edit_message(content="🗑 เป้าหมายนี้ถูกลบแล้ว", view=None, embed=None)
-        else:
-            await interaction.response.send_message("เป้าหมายนี้ไม่มีอยู่แล้ว", ephemeral=True)
-
-    @discord.ui.button(label="🔄 เช็คราคาอีกครั้ง", style=discord.ButtonStyle.primary)
-    async def recheck_price(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ คุณไม่มีสิทธิ์กดปุ่มนี้", ephemeral=True)
-            return
-
+    @discord.ui.button(label="📊 ดูราคา", style=discord.ButtonStyle.primary)
+    async def check_price(self, interaction: discord.Interaction, button: discord.ui.Button):
         price = get_stock_price(self.symbol)
-        if price is None:
-            await interaction.response.send_message(f"❌ ไม่สามารถดึงราคาของ {self.symbol}", ephemeral=True)
-            return
+        if price:
+            await interaction.response.send_message(f"💹 {self.symbol} ราคาปัจจุบัน: {price:.2f}", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ ไม่สามารถดึงราคาได้", ephemeral=True)
 
-        embed = discord.Embed(
-            title=f"📊 {self.symbol} (อัปเดตใหม่)",
-            description=f"ราคาปัจจุบัน: **{price}**",
-            color=discord.Color.green()
+    @discord.ui.button(label="🗑️ ลบเป้าหมาย", style=discord.ButtonStyle.danger)
+    async def remove_target(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.user_id in user_targets and self.symbol in user_targets[self.user_id]:
+            del user_targets[self.user_id][self.symbol]
+            await interaction.response.send_message(f"✅ ลบเป้าหมาย {self.symbol} เรียบร้อย", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ ไม่มีเป้าหมายนี้", ephemeral=True)
+
+# ============ Command ============
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    check_prices.start()
+
+@bot.command()
+async def set(ctx, stock: str, target: float):
+    """ตั้งเป้าหมายหุ้น เช่น /set PTT 35"""
+    symbol = format_symbol(stock)
+    user_id = ctx.author.id
+
+    if user_id not in user_targets:
+        user_targets[user_id] = {}
+    user_targets[user_id][symbol] = target
+
+    await ctx.send(f"📌 {ctx.author.mention} ตั้งเป้า {symbol} ที่ {target}")
+
+@bot.command()
+async def all(ctx):
+    """ดูเป้าหมายทั้งหมดของตัวเองแบบ Embed"""
+    user_id = ctx.author.id
+    targets = user_targets.get(user_id, {})
+    if not targets:
+        await ctx.send("❌ คุณยังไม่ได้ตั้งเป้า")
+        return
+
+    embed = discord.Embed(
+        title="🎯 เป้าหมายหุ้นของคุณ",
+        description=f"ตั้งโดย {ctx.author.mention}",
+        color=discord.Color.green()
+    )
+
+    for symbol, target in targets.items():
+        embed.add_field(
+            name=symbol,
+            value=f"📌 ราคาเป้าหมาย: **{target}**",
+            inline=False
         )
-        await interaction.response.edit_message(embed=embed, view=self)
 
-# =====================
-# Background task
-# =====================
-@tasks.loop(minutes=3)
-async def check_stocks():
-    for uid_str, targets in user_targets.items():
-        user_id = int(uid_str)
+    embed.set_footer(text="บอทติดตามหุ้น 24/7")
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2331/2331943.png")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def remove(ctx, stock: str):
+    """ลบเป้าหมายหุ้น เช่น /remove PTT"""
+    symbol = format_symbol(stock)
+    user_id = ctx.author.id
+    if user_id in user_targets and symbol in user_targets[user_id]:
+        del user_targets[user_id][symbol]
+        await ctx.send(f"🗑️ ลบ {symbol} เรียบร้อย")
+    else:
+        await ctx.send("❌ ไม่พบหุ้นนี้ในเป้าหมายของคุณ")
+
+@bot.command()
+async def helpme(ctx):
+    """คำสั่งทั้งหมด"""
+    help_text = """
+📖 คำสั่งบอทหุ้น
+/set [หุ้น] [ราคา] → ตั้งเป้าหมาย
+/all → ดูเป้าหมายทั้งหมด
+/remove [หุ้น] → ลบเป้าหมาย
+/helpme → ดูคำสั่งทั้งหมด
+    """
+    await ctx.send(help_text)
+
+# ============ Loop เช็คราคา ============
+@tasks.loop(minutes=5)  # แจ้งเตือนทุก 5 นาที
+async def check_prices():
+    for user_id, targets in user_targets.items():
         user = await bot.fetch_user(user_id)
-
-        for sym, info in targets.items():
-            price = get_stock_price(sym)
+        for symbol, target in targets.items():
+            price = get_stock_price(symbol)
             if price is None:
                 continue
 
-            target = info["target"]
-            use_dm = info["dm"]
-
             if price <= target:
-                embed = discord.Embed(
-                    title=f"⚠️ หุ้น {sym}",
-                    description=f"ราคาปัจจุบัน {price} ≤ เป้าหมาย {target}",
-                    color=discord.Color.red()
-                )
-
                 # ลบข้อความเก่า
-                if uid_str in last_alerts and sym in last_alerts[uid_str]:
+                if user_id in last_alerts and symbol in last_alerts[user_id]:
                     try:
-                        await last_alerts[uid_str][sym].delete()
-                    except Exception:
+                        await last_alerts[user_id][symbol].delete()
+                    except:
                         pass
 
-                # ส่งข้อความใหม่
-                if use_dm:
-                    msg = await user.send(embed=embed, view=StockAlertView(user_id, sym))
-                else:
-                    channel = bot.get_channel(CHANNEL_ID)
-                    if channel and isinstance(channel, discord.TextChannel):
-                        msg = await channel.send(
-                            content=f"{user.mention}",
-                            embed=embed,
-                            view=StockAlertView(user_id, sym)
-                        )
-                    else:
-                        continue
+                # สร้าง Embed แจ้งเตือน พร้อม mention + emoji 🔔
+                embed = discord.Embed(
+                    title=f"🔔 แจ้งเตือนหุ้น {symbol}",
+                    description=(
+                        f"{user.mention}\n"
+                        f"ราคาปัจจุบัน **{price:.2f}** ต่ำกว่าหรือเท่ากับเป้า **{target}**"
+                    ),
+                    color=discord.Color.red()
+                )
+                embed.set_footer(text="ระบบแจ้งเตือนอัตโนมัติทุก 5 นาที")
+                embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2331/2331930.png")
 
-                if uid_str not in last_alerts:
-                    last_alerts[uid_str] = {}
-                last_alerts[uid_str][sym] = msg
+                msg = await user.send(embed=embed, view=StockAlertView(user_id, symbol))
 
-# =====================
-# Slash Commands
-# =====================
-@tree.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
-async def set_cmd(interaction: discord.Interaction, symbol: str, target: float, dm: bool = False):
-    uid = str(interaction.user.id)
-    symbol = symbol.upper()
-    if uid not in user_targets:
-        user_targets[uid] = {}
-    user_targets[uid][symbol] = {"target": target, "dm": dm}
-    save_data()
-    await interaction.response.send_message(
-        f"✅ ตั้ง {symbol} ที่ {target} (ส่งทาง {'DM' if dm else 'ช่องรวม'})",
-        ephemeral=True
-    )
+                # เก็บข้อความล่าสุด
+                if user_id not in last_alerts:
+                    last_alerts[user_id] = {}
+                last_alerts[user_id][symbol] = msg
 
-@tree.command(name="all", description="ดูเป้าหมายหุ้นของคุณ")
-async def all_cmd(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    if uid not in user_targets or not user_targets[uid]:
-        await interaction.response.send_message("คุณยังไม่ได้ตั้งเป้าหมาย", ephemeral=True)
-        return
-    msg = "📊 เป้าหมายของคุณ:\n"
-    for sym, info in user_targets[uid].items():
-        msg += f"- {sym}: {info['target']} ({'DM' if info['dm'] else 'ช่องรวม'})\n"
-    await interaction.response.send_message(msg, ephemeral=True)
-
-@tree.command(name="check", description="เช็คราคาหุ้นตอนนี้")
-async def check_cmd(interaction: discord.Interaction, symbol: str):
-    symbol = symbol.upper()
-    price = get_stock_price(symbol)
-    if price is None:
-        await interaction.response.send_message(f"❌ ไม่สามารถดึงราคาของ {symbol}", ephemeral=True)
-        return
-    await interaction.response.send_message(f"💹 {symbol} ตอนนี้ {price}", ephemeral=True)
-
-@tree.command(name="remove", description="ลบเป้าหมายหุ้น")
-async def remove_cmd(interaction: discord.Interaction, symbol: str):
-    uid = str(interaction.user.id)
-    symbol = symbol.upper()
-    if uid in user_targets and symbol in user_targets[uid]:
-        del user_targets[uid][symbol]
-        save_data()
-        await interaction.response.send_message(f"🗑 ลบ {symbol} แล้ว", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ คุณไม่ได้ตั้ง {symbol}", ephemeral=True)
-
-# =====================
-# Events
-# =====================
-@bot.event
-async def on_ready():
-    load_data()
-    await tree.sync()
-    print(f"✅ Logged in as {bot.user}")
-    check_stocks.start()
-
-# =====================
-# Run bot
-# =====================
-if DISCORD_TOKEN:
+# ============ Run ============
+if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
-else:
-    print("❌ กรุณาตั้งค่า DISCORD_TOKEN")
