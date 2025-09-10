@@ -11,7 +11,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# user_targets: {user_id: {symbol: target_price}}
+# user_targets: {user_id: {symbol: (target_price, dm_bool)}}
 user_targets = {}
 last_alerts = {}  # {user_id: {symbol: message_obj}}
 
@@ -76,13 +76,26 @@ async def on_ready():
         print(f"Slash command sync error: {e}")
 
 @bot.tree.command(name="set", description="ตั้งเป้าหมายหุ้น เช่น /set PTT 35")
-async def set(interaction: discord.Interaction, stock: str, target: float):
+@app_commands.describe(stock="หุ้นที่ต้องการติดตาม", target="ราคาเป้าหมาย", dm="ส่ง DM หรือโพสต์ใน Channel")
+async def set(interaction: discord.Interaction, stock: str, target: float, dm: bool = True):
     symbol = format_symbol(stock)
     user_id = interaction.user.id
     if user_id not in user_targets:
         user_targets[user_id] = {}
-    user_targets[user_id][symbol] = target
-    await interaction.response.send_message(f"📌 {interaction.user.mention} ตั้งเป้า {symbol} ที่ {target}")
+    user_targets[user_id][symbol] = (target, dm)
+
+    # ส่ง Embed แจ้งตั้งเป้า
+    embed = discord.Embed(
+        title=f"📌 ตั้งเป้าหมาย {symbol}",
+        description=f"เป้าหมาย: **{target}**\nส่ง DM: {dm}",
+        color=discord.Color.green()
+    )
+
+    if dm:
+        await interaction.user.send(embed=embed, view=StockAlertView(user_id, symbol))
+        await interaction.response.send_message("✅ ตั้งเป้าหมายเรียบร้อย (ส่ง DM แล้ว)", ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=StockAlertView(user_id, symbol))
 
 @bot.tree.command(name="all", description="ดูเป้าหมายทั้งหมดของคุณ")
 async def all(interaction: discord.Interaction):
@@ -97,11 +110,10 @@ async def all(interaction: discord.Interaction):
         description=f"ตั้งโดย {interaction.user.mention}",
         color=discord.Color.green()
     )
-    for symbol, target in targets.items():
-        embed.add_field(name=symbol, value=f"📌 ราคาเป้าหมาย: **{target}**", inline=False)
+    for symbol, (target, dm) in targets.items():
+        embed.add_field(name=symbol, value=f"📌 ราคาเป้าหมาย: **{target}** | DM: {dm}", inline=False)
     embed.set_footer(text="บอทติดตามหุ้น 24/7")
     embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2331/2331943.png")
-
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="remove", description="ลบเป้าหมายหุ้น")
@@ -118,7 +130,7 @@ async def remove(interaction: discord.Interaction, stock: str):
 async def helpme(interaction: discord.Interaction):
     help_text = (
         "📖 **คำสั่งบอทหุ้น**\n"
-        "/set [หุ้น] [ราคา] → ตั้งเป้าหมาย\n"
+        "/set [หุ้น] [ราคา] [dm: True/False] → ตั้งเป้าหมาย\n"
         "/all → ดูเป้าหมายทั้งหมด\n"
         "/remove [หุ้น] → ลบเป้าหมาย\n"
         "/helpme → ดูคำสั่งทั้งหมด\n"
@@ -133,7 +145,7 @@ async def check_prices():
             user = await bot.fetch_user(user_id)
         except:
             continue
-        for symbol, target in targets.items():
+        for symbol, (target, dm) in targets.items():
             price = get_stock_price(symbol)
             if price is None:
                 continue
@@ -148,15 +160,18 @@ async def check_prices():
                 embed = discord.Embed(
                     title=f"🔔 แจ้งเตือนหุ้น {symbol}",
                     description=(
-                        f"{user.mention}\n"
-                        f"ราคาปัจจุบัน **{price:.2f}** ต่ำกว่าหรือเท่ากับเป้า **{target}**"
+                        f"{user.mention}\nราคาปัจจุบัน **{price:.2f}** ต่ำกว่าหรือเท่ากับเป้า **{target}**"
                     ),
                     color=discord.Color.red()
                 )
                 embed.set_footer(text="ระบบแจ้งเตือนอัตโนมัติทุก 5 นาที")
                 embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2331/2331930.png")
 
-                msg = await user.send(embed=embed, view=StockAlertView(user_id, symbol))
+                if dm:
+                    msg = await user.send(embed=embed, view=StockAlertView(user_id, symbol))
+                else:
+                    channel = await bot.fetch_channel(interaction.channel_id)
+                    msg = await channel.send(embed=embed, view=StockAlertView(user_id, symbol))
 
                 if user_id not in last_alerts:
                     last_alerts[user_id] = {}
