@@ -1,6 +1,7 @@
 import os
 import discord
 from discord.ext import tasks, commands
+from discord import app_commands  # << ต้องมีเพื่อใช้ Slash Command
 import requests
 import yfinance as yf
 
@@ -84,7 +85,6 @@ async def set(interaction: discord.Interaction, stock: str, target: float, dm: b
         user_targets[user_id] = {}
     user_targets[user_id][symbol] = (target, dm)
 
-    # ส่ง Embed แจ้งตั้งเป้า
     embed = discord.Embed(
         title=f"📌 ตั้งเป้าหมาย {symbol}",
         description=f"เป้าหมาย: **{target}**\nส่ง DM: {dm}",
@@ -170,8 +170,13 @@ async def check_prices():
                 if dm:
                     msg = await user.send(embed=embed, view=StockAlertView(user_id, symbol))
                 else:
-                    channel = await bot.fetch_channel(interaction.channel_id)
-                    msg = await channel.send(embed=embed, view=StockAlertView(user_id, symbol))
+                    # ส่งใน Channel ที่ผู้ใช้ execute command ล่าสุด
+                    # ต้องมี fallback ถ้าไม่รู้ channel ให้ส่ง DM แทน
+                    try:
+                        channel = interaction.channel  # ใช้ channel ล่าสุด
+                        msg = await channel.send(embed=embed, view=StockAlertView(user_id, symbol))
+                    except:
+                        msg = await user.send(embed=embed, view=StockAlertView(user_id, symbol))
 
                 if user_id not in last_alerts:
                     last_alerts[user_id] = {}
