@@ -1,9 +1,9 @@
 # main.py
-# Discord stock alert bot (full-featured)
-# - Finnhub for non-.BK (US / global)
-# - yfinance for .BK (Thai)
-# - Slash commands, embed, buttons, persistence, support calc
-# - Author: generated assistant
+# Discord stock alert bot (full)
+# - Finnhub สำหรับ non-.BK (US/Global)
+# - yfinance สำหรับ .BK (หุ้นไทย)
+# - Slash commands, embed, buttons, persistence (targets.json)
+# - /support คำนวณ Pivot/SMA/ATR/Fibonacci และปุ่มตั้งเป้าอัตโนมัติ
 
 import os
 import json
@@ -21,21 +21,22 @@ from discord.ext import tasks, commands
 from discord import app_commands
 
 # ------------------------
-# Basic config / logging
+# Config & Logging
 # ------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stockbot")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")  # optional (required for non-.BK)
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")  # optional but required for non-.BK
 DATA_FILE = "targets.json"
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))  # default 5 minutes
+PRICE_CACHE_TTL = 30  # seconds cache for fetched prices
 
 # ------------------------
 # Bot init
 # ------------------------
 intents = discord.Intents.default()
-intents.message_content = True  # not strictly required for slash, useful for fallback messages
+intents.message_content = True  # not required for slash but handy
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ------------------------
@@ -43,14 +44,13 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 # ------------------------
 # user_targets: { user_id_str: { symbol: { "target": float, "dm": bool, "channel_id": Optional[int] } } }
 user_targets: Dict[str, Dict[str, Dict[str, Any]]] = {}
-# last_alerts: { user_id_str: { symbol: discord.Message } }
+# last_alerts: { user_id_str: { symbol: discord.Message } } - in-memory only
 last_alerts: Dict[str, Dict[str, discord.Message]] = {}
-# Locks for thread-safety
-data_lock = asyncio.Lock()
-
-# Simple cache for prices to reduce repeated requests in same interval
+# price cache: symbol -> (price_or_None, timestamp)
 price_cache: Dict[str, Tuple[Optional[float], float]] = {}
-PRICE_CACHE_TTL = 30  # seconds
+
+# async lock to protect user_targets and file writes
+data_lock = asyncio.Lock()
 
 # ------------------------
 # Persistence helpers
@@ -61,20 +61,21 @@ def load_data() -> None:
         if os.path.isfile(DATA_FILE):
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 user_targets = json.load(f)
-                # normalize types
-                for uid, targets in list(user_targets.items()):
-                    for sym, info in list(targets.items()):
-                        try:
-                            info["target"] = float(info.get("target"))
-                            info["dm"] = bool(info.get("dm", True))
-                            ch = info.get("channel_id", None)
-                            info["channel_id"] = int(ch) if ch is not None else None
-                        except (TypeError, ValueError):
-                            logger.warning("Invalid stored target format; removing %s %s", uid, sym)
-                            user_targets[uid].pop(sym, None)
+            # normalize types
+            for uid, tmap in list(user_targets.items()):
+                for sym, info in list(tmap.items()):
+                    try:
+                        info["target"] = float(info.get("target"))
+                        info["dm"] = bool(info.get("dm", True))
+                        ch = info.get("channel_id")
+                        info["channel_id"] = int(ch) if ch is not None else None
+                    except (TypeError, ValueError):
+                        logger.warning("Invalid stored target, removing %s:%s", uid, sym)
+                        user_targets[uid].pop(sym, None)
             logger.info("Loaded targets for %d users", len(user_targets))
         else:
             user_targets = {}
+            logger.info("No targets file found; starting fresh")
     except Exception as e:
         logger.exception("Failed to load data: %s", e)
         user_targets = {}
@@ -83,49 +84,49 @@ def save_data() -> None:
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(user_targets, f, ensure_ascii=False, indent=2)
-        logger.info("Saved targets to %s", DATA_FILE)
+        logger.info("Saved targets")
     except Exception as e:
         logger.exception("Failed to save data: %s", e)
 
 # ------------------------
 # Price fetchers
 # ------------------------
-def _cache_get(symbol: str) -> Optional[float]:
+def cache_get(symbol: str) -> Optional[float]:
     now = time.time()
-    cached = price_cache.get(symbol)
-    if cached and now - cached[1] < PRICE_CACHE_TTL:
-        return cached[0]
+    entry = price_cache.get(symbol)
+    if entry and (now - entry[1] < PRICE_CACHE_TTL):
+        return entry[0]
     return None
 
-def _cache_set(symbol: str, price: Optional[float]) -> None:
+def cache_set(symbol: str, price: Optional[float]) -> None:
     price_cache[symbol] = (price, time.time())
 
 def get_price_finnhub(symbol: str) -> Optional[float]:
-    """Query Finnhub for symbol (non-.BK). Returns price or None"""
+    """Get price from Finnhub for non-.BK symbols."""
     if not FINNHUB_API_KEY:
         return None
-    cached = _cache_get(symbol)
+    cached = cache_get(symbol)
     if cached is not None:
         return cached
     try:
         url = "https://finnhub.io/api/v1/quote"
-        resp = requests.get(url, params={"symbol": symbol, "token": FINNHUB_API_KEY}, timeout=10)
-        resp.raise_for_status()
-        j = resp.json()
+        r = requests.get(url, params={"symbol": symbol, "token": FINNHUB_API_KEY}, timeout=10)
+        r.raise_for_status()
+        j = r.json()
         c = j.get("c")
         price = float(c) if c is not None else None
-        _cache_set(symbol, price)
+        cache_set(symbol, price)
         return price
     except requests.RequestException as e:
-        logger.warning("Finnhub request failed for %s: %s", symbol, e)
+        logger.warning("Finnhub request error for %s: %s", symbol, e)
     except Exception as e:
         logger.exception("Unexpected Finnhub error for %s: %s", symbol, e)
-    _cache_set(symbol, None)
+    cache_set(symbol, None)
     return None
 
 def get_price_yf(symbol: str) -> Optional[float]:
-    """Use yfinance for .BK symbols. Robust against missing data."""
-    cached = _cache_get(symbol)
+    """Get price from yfinance for .BK symbols (Thai). Robust checks."""
+    cached = cache_get(symbol)
     if cached is not None:
         return cached
     symbol_u = symbol.strip().upper()
@@ -134,42 +135,39 @@ def get_price_yf(symbol: str) -> Optional[float]:
         hist = tk.history(period="2d", interval="1d", actions=False)
         if hist is not None and not hist.empty and "Close" in hist.columns:
             price = float(hist["Close"].iloc[-1])
-            _cache_set(symbol, price)
+            cache_set(symbol, price)
             return price
-        # fallback: try fast_info if available
+        # fallback to fast_info if available
         try:
             fi = tk.fast_info
             last_price = None
             if isinstance(fi, dict):
-                last_price = fi.get("last_price") or fi.get("lastPrice") or fi.get("lastPrice")
+                last_price = fi.get("last_price") or fi.get("lastPrice")
             else:
                 last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
-            if last_price:
+            if last_price is not None:
                 price = float(last_price)
-                _cache_set(symbol, price)
+                cache_set(symbol, price)
                 return price
         except Exception:
             pass
     except Exception as e:
-        # yfinance throws when symbol invalid (e.g., NVDA.BK). Log and return None
         logger.debug("yfinance error for %s: %s", symbol_u, e)
-    _cache_set(symbol, None)
+    cache_set(symbol, None)
     return None
 
 def get_stock_price(symbol: str) -> Optional[float]:
-    """Main price getter. If symbol endswith .BK -> yfinance; else Finnhub"""
     s = symbol.strip().upper()
     if s.endswith(".BK"):
         return get_price_yf(s)
     return get_price_finnhub(s)
 
 # ------------------------
-# Utility helpers
+# Utilities
 # ------------------------
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
-# Format a friendly short price string
 def fmt_price(p: Optional[float]) -> str:
     if p is None:
         return "N/A"
@@ -179,7 +177,7 @@ def fmt_price(p: Optional[float]) -> str:
         return str(p)
 
 # ------------------------
-# View / Buttons
+# UI: View with buttons (persistent during runtime)
 # ------------------------
 class StockAlertView(discord.ui.View):
     def __init__(self, owner_id: int, symbol: str):
@@ -194,7 +192,7 @@ class StockAlertView(discord.ui.View):
             return
         price = get_stock_price(self.symbol)
         if price is None:
-            await interaction.response.send_message(f"❌ ไม่สามารถดึงราคาของ {self.symbol} ได้", ephemeral=True)
+            await interaction.response.send_message(f"❌ ไม่สามารถดึงราคา {self.symbol} ได้", ephemeral=True)
             return
         await interaction.response.send_message(f"💹 {self.symbol} ราคาปัจจุบัน: {fmt_price(price)}", ephemeral=True)
 
@@ -208,7 +206,6 @@ class StockAlertView(discord.ui.View):
             if uid in user_targets and self.symbol in user_targets[uid]:
                 user_targets[uid].pop(self.symbol, None)
                 save_data()
-                # delete previous alert message if present
                 prev = last_alerts.get(uid, {}).pop(self.symbol, None)
                 if prev:
                     try:
@@ -221,10 +218,8 @@ class StockAlertView(discord.ui.View):
             else:
                 await interaction.response.send_message("❌ ไม่พบเป้าหมายนี้", ephemeral=True)
 
-    # custom button callback for "set to level" will be created dynamically by /support command when needed
-
 # ------------------------
-# Support (pivot / fib / sma / atr)
+# Support calculation (Pivot / SMA / ATR / Fibonacci)
 # ------------------------
 def compute_support_resistance(symbol: str, lookback_days: int = 60) -> Optional[Dict[str, Any]]:
     symbol_u = normalize_symbol(symbol)
@@ -232,9 +227,9 @@ def compute_support_resistance(symbol: str, lookback_days: int = 60) -> Optional
         tk = yf.Ticker(symbol_u)
         df = tk.history(period=f"{max(lookback_days,30)}d", interval="1d", actions=False)
     except Exception as e:
-        logger.debug("yfinance history error for %s: %s", symbol_u, e)
+        logger.debug("yfinance history error %s: %s", symbol_u, e)
         return None
-    if df is None or df.empty or not set(["High", "Low", "Close"]).issubset(df.columns):
+    if df is None or df.empty or not {"High", "Low", "Close"}.issubset(df.columns):
         return None
 
     df = df.dropna(subset=["High", "Low", "Close"])
@@ -255,7 +250,6 @@ def compute_support_resistance(symbol: str, lookback_days: int = 60) -> Optional
     sma20 = float(df["Close"].rolling(window=20).mean().iloc[-1]) if len(df) >= 20 else None
     sma50 = float(df["Close"].rolling(window=50).mean().iloc[-1]) if len(df) >= 50 else None
 
-    # ATR14
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
@@ -309,12 +303,12 @@ async def on_ready():
     except Exception as e:
         logger.warning("Slash sync failed: %s", e)
     check_loop.start()
-    logger.info("Bot ready. Checking every %d minutes", CHECK_INTERVAL_MINUTES)
+    logger.info("Bot ready — checking every %d minutes", CHECK_INTERVAL_MINUTES)
 
-@bot.tree.command(name="set", description="ตั้งเป้าหมายหุ้น เช่น /set AAPL 170 dm:true/false")
-@app_commands.describe(symbol="เช่น AAPL หรือ PTT.BK (ถ้าเป็นหุ้นไทยต้องใส่ .BK เอง)", target="ราคาเป้าหมาย", dm="ส่ง DM หรือโพสต์ใน Channel")
+@bot.tree.command(name="set", description="ตั้งเป้าหมายหุ้น: /set SYMBOL TARGET dm:true/false")
+@app_commands.describe(symbol="เช่น AAPL หรือ PTT.BK (ถ้าต้องการหุ้นไทยต้องใส่ .BK เอง)", target="ราคาเป้าหมาย", dm="ส่ง DM หรือโพสต์ใน Channel")
 async def slash_set(interaction: discord.Interaction, symbol: str, target: float, dm: bool = True):
-    sym_norm = normalize_symbol(symbol)
+    sym = normalize_symbol(symbol)
     uid_str = str(interaction.user.id)
     channel_id = None
     if not dm and interaction.channel is not None:
@@ -322,26 +316,29 @@ async def slash_set(interaction: discord.Interaction, symbol: str, target: float
 
     async with data_lock:
         user_targets.setdefault(uid_str, {})
-        user_targets[uid_str][sym_norm] = {"target": float(target), "dm": bool(dm), "channel_id": channel_id}
+        user_targets[uid_str][sym] = {"target": float(target), "dm": bool(dm), "channel_id": channel_id}
         save_data()
 
     embed = discord.Embed(
-        title=f"📌 ตั้งเป้าหมาย {sym_norm}",
+        title=f"📌 ตั้งเป้าหมาย {sym}",
         description=f"เป้าหมาย: **{fmt_price(target)}**\nส่งทาง: **{'DM' if dm else 'Channel'}**",
         color=discord.Color.green()
     )
-    embed.set_footer(text="หากต้องการหุ้นไทย ให้ใส่ .BK เช่น PTT.BK")
+    embed.set_footer(text="หากต้องการติดตามหุ้นไทย ให้ใส่ .BK เช่น PTT.BK")
 
-    # send confirmation: DM if dm else response in channel with view
-    view = StockAlertView(interaction.user.id, sym_norm)
+    view = StockAlertView(interaction.user.id, sym)
     if dm:
         try:
             await interaction.user.send(embed=embed, view=view)
             await interaction.response.send_message("✅ ตั้งเป้าหมายเรียบร้อย — ส่งยืนยันทาง DM แล้ว", ephemeral=True)
         except discord.Forbidden:
-            # can't DM -> fallback to channel
-            await interaction.response.send_message("⚠️ ไม่สามารถส่ง DM ได้ — จะแสดงยืนยันในช่องนี้แทน", ephemeral=True)
-            await interaction.channel.send(embed=embed, view=view)
+            # fallback to channel
+            await interaction.response.send_message("⚠️ ไม่สามารถส่ง DM ได้ — แสดงยืนยันในช่องนี้แทน", ephemeral=True)
+            if interaction.channel:
+                try:
+                    await interaction.channel.send(embed=embed, view=view)
+                except discord.Forbidden:
+                    logger.warning("No permission to send in channel for confirmation")
     else:
         await interaction.response.send_message(embed=embed, view=view)
 
@@ -358,21 +355,21 @@ async def slash_all(interaction: discord.Interaction):
     for sym, info in targets.items():
         dm_flag = bool(info.get("dm", True))
         ch_id = info.get("channel_id")
-        ch_text = f"Channel({ch_id})" if ch_id else "DM" if dm_flag else "-"
+        ch_text = f"Channel({ch_id})" if ch_id else ("DM" if dm_flag else "-")
         embed.add_field(name=sym, value=f"เป้า: **{fmt_price(info['target'])}** | {ch_text}", inline=False)
     embed.set_footer(text="ใช้ /set SYMBOL TARGET dm:true/false เพื่อตั้งเป้าหมาย")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="remove", description="ลบเป้าหมายของคุณ")
-@app_commands.describe(symbol="symbol ที่จะลบ เช่น AAPL หรือ PTT.BK")
+@app_commands.describe(symbol="เช่น AAPL หรือ PTT.BK")
 async def slash_remove(interaction: discord.Interaction, symbol: str):
-    sym_norm = normalize_symbol(symbol)
+    sym = normalize_symbol(symbol)
     uid_str = str(interaction.user.id)
     async with data_lock:
-        if uid_str in user_targets and sym_norm in user_targets[uid_str]:
-            user_targets[uid_str].pop(sym_norm, None)
+        if uid_str in user_targets and sym in user_targets[uid_str]:
+            user_targets[uid_str].pop(sym, None)
             save_data()
-            prev = last_alerts.get(uid_str, {}).pop(sym_norm, None)
+            prev = last_alerts.get(uid_str, {}).pop(sym, None)
             if prev:
                 try:
                     await prev.delete()
@@ -380,81 +377,81 @@ async def slash_remove(interaction: discord.Interaction, symbol: str):
                     pass
                 except discord.Forbidden:
                     pass
-            await interaction.response.send_message(f"🗑️ ลบ {sym_norm} เรียบร้อย", ephemeral=True)
+            await interaction.response.send_message(f"🗑️ ลบ {sym} เรียบร้อย", ephemeral=True)
         else:
-            await interaction.response.send_message(f"❌ ไม่พบ {sym_norm} ในเป้าหมายของคุณ", ephemeral=True)
+            await interaction.response.send_message(f"❌ ไม่พบ {sym} ในเป้าหมายของคุณ", ephemeral=True)
 
 @bot.tree.command(name="check", description="เช็คราคาหุ้นปัจจุบัน")
 @app_commands.describe(symbol="เช่น AAPL หรือ PTT.BK")
 async def slash_check(interaction: discord.Interaction, symbol: str):
-    sym_norm = normalize_symbol(symbol)
+    sym = normalize_symbol(symbol)
     await interaction.response.defer(ephemeral=True)
-    price = get_stock_price(sym_norm)
+    price = get_stock_price(sym)
     if price is None:
-        await interaction.followup.send(f"❌ ไม่สามารถดึงราคาของ {sym_norm} ได้", ephemeral=True)
+        await interaction.followup.send(f"❌ ไม่สามารถดึงราคาของ {sym} ได้", ephemeral=True)
     else:
-        await interaction.followup.send(f"💹 {sym_norm} = {fmt_price(price)}", ephemeral=True)
+        await interaction.followup.send(f"💹 {sym} = {fmt_price(price)}", ephemeral=True)
 
 @bot.tree.command(name="support", description="คำนวณแนวรับ/แนวต้าน (Pivot, SMA, ATR, Fibonacci)")
 @app_commands.describe(symbol="เช่น AAPL หรือ PTT.BK", lookback="จำนวนวันที่ใช้หา swing high/low")
 async def slash_support(interaction: discord.Interaction, symbol: str, lookback: int = 60):
-    sym_norm = normalize_symbol(symbol)
+    sym = normalize_symbol(symbol)
     await interaction.response.defer()
-    data = compute_support_resistance(sym_norm, lookback_days=lookback)
+    data = compute_support_resistance(sym, lookback_days=lookback)
     if not data:
-        await interaction.followup.send(f"❌ ไม่พบข้อมูลราคา {sym_norm}", ephemeral=True)
+        await interaction.followup.send(f"❌ ไม่พบข้อมูลราคา {sym}", ephemeral=True)
         return
 
-    embed = discord.Embed(title=f"🧭 แนวรับ-แนวต้าน: {data['symbol']}", description=f"ราคาปิดล่าสุด: **{fmt_price(data['last_close'])}**", color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"🧭 แนวรับ-แนวต้าน: {data['symbol']}",
+        description=f"ราคาปิดล่าสุด: **{fmt_price(data['last_close'])}** (ย้อนหลัง {data['lookback_days']} วัน)",
+        color=discord.Color.blurple()
+    )
     embed.add_field(name="Pivot (Classic)", value=f"P = {fmt_price(data['pivot'])}\nR1 = {fmt_price(data['R1'])}\nS1 = {fmt_price(data['S1'])}", inline=False)
     embed.add_field(name="R2 / S2", value=f"R2 = {fmt_price(data['R2'])}\nS2 = {fmt_price(data['S2'])}", inline=False)
-    sma_text = f"SMA20 = {fmt_price(data['sma20'])}\nSMA50 = {fmt_price(data['sma50'])}"
-    atr_text = f"ATR14 = {fmt_price(data['atr14'])}"
-    embed.add_field(name="Moving averages", value=f"{sma_text}\n{atr_text}", inline=False)
+    embed.add_field(name="Moving averages / ATR", value=f"SMA20 = {fmt_price(data['sma20'])}\nSMA50 = {fmt_price(data['sma50'])}\nATR14 = {fmt_price(data['atr14'])}", inline=False)
     if data.get("fib"):
         fib_lines = "\n".join([f"{k}: {fmt_price(v)}" for k, v in data["fib"].items()])
         embed.add_field(name="Fibonacci (swing high->low)", value=fib_lines, inline=False)
-    embed.set_footer(text="กดปุ่มด้านล่างเพื่อตั้งเป้าจากระดับที่ต้องการ")
+    embed.set_footer(text="กดปุ่มด้านล่างเพื่อตั้งเป้าจากระดับที่ต้องการ (จะบันทึกเป็น DM)")
 
-    # create a view with dynamic buttons for fib levels + pivot + s1/s2
+    # make view with buttons for some levels (S1, Pivot, R1, and up to two fib levels)
     view = discord.ui.View(timeout=None)
-    # add a button to set to S1, Pivot, R1, fib_0.618 etc.
-    async def make_set_callback(level_value: float):
+    levels: List[Tuple[str, Optional[float]]] = [
+        ("S1", data.get("S1")),
+        ("Pivot", data.get("pivot")),
+        ("R1", data.get("R1"))
+    ]
+    # choose up to two fib levels closest to last_close
+    fib_map = data.get("fib", {})
+    if fib_map:
+        fib_items = sorted(fib_map.items(), key=lambda kv: abs(kv[1] - data["last_close"]))
+        for k, v in fib_items[:2]:
+            levels.append((f"Fib {k}", v))
+
+    # helper to create callback for each button
+    def make_callback(level_value: float, sym_inner: str):
         async def callback(interaction2: discord.Interaction):
+            if interaction2.user.id != interaction.user.id:
+                await interaction2.response.send_message("❌ คุณไม่สามารถตั้งเป้าให้บัญชีอื่นได้", ephemeral=True)
+                return
             uid_str = str(interaction2.user.id)
-            # ensure owner sets only their own targets
-            sym = sym_norm
             async with data_lock:
                 user_targets.setdefault(uid_str, {})
-                user_targets[uid_str][sym] = {"target": float(level_value), "dm": True, "channel_id": None}
+                user_targets[uid_str][sym_inner] = {"target": float(level_value), "dm": True, "channel_id": None}
                 save_data()
-            await interaction2.response.send_message(f"✅ ตั้งเป้า {sym} = {fmt_price(level_value)} ให้บัญชีของคุณแล้ว (DM)", ephemeral=True)
+            await interaction2.response.send_message(f"✅ ตั้งเป้า {sym_inner} = {fmt_price(level_value)} ให้บัญชีของคุณแล้ว (ส่ง DM)", ephemeral=True)
         return callback
 
-    # standard levels to show as buttons (limit to reasonable number)
-    levels: List[Tuple[str, float]] = []
-    levels.append(("S1", data["S1"]))
-    levels.append(("Pivot", data["pivot"]))
-    levels.append(("R1", data["R1"]))
-    # add fib keys sorted by closeness to last_close
-    fib_map = data.get("fib", {})
-    for k, v in fib_map.items():
-        levels.append((f"Fib {k}", v))
-
-    # attach buttons (max 5 to avoid UI clutter)
-    for i, (label, val) in enumerate(levels[:5]):
+    for i, (label, val) in enumerate(levels):
         if val is None:
             continue
-        # create button and callback
-        custom_id = f"set_{label}_{int(time.time())}_{i}"
-        btn = discord.ui.Button(label=f"Set {label} {fmt_price(val)}", style=discord.ButtonStyle.secondary)
-        # assign a callback
-        callback_coro = make_set_callback(val)
-        btn.callback = callback_coro  # type: ignore
+        btn = discord.ui.Button(label=f"{label} {fmt_price(val)}", style=discord.ButtonStyle.secondary)
+        btn.callback = make_callback(val, sym)  # type: ignore
         view.add_item(btn)
 
-    # also add a generic "Set custom" button that opens ephemeral prompt (simpler: instruct user)
-    view.add_item(discord.ui.Button(label="Manual /set", style=discord.ButtonStyle.link, url="https://discord.com/"))  # placeholder
+    # add an informational button for manual set
+    view.add_item(discord.ui.Button(label="ตั้งเอง /set", style=discord.ButtonStyle.link, url="https://discord.com/"))
 
     await interaction.followup.send(embed=embed, view=view)
 
@@ -476,23 +473,24 @@ async def slash_helpme(interaction: discord.Interaction):
 # ------------------------
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def check_loop():
-    logger.info("Running check loop for targets (users=%d)", len(user_targets))
-    # shallow copy keys to avoid mutation during loop
+    logger.info("Running check loop — users=%d", len(user_targets))
+    # make shallow copy to iterate safely
     async with data_lock:
-        local_targets = {uid: dict(targets) for uid, targets in user_targets.items()}  # deep copy top-level
-    for uid_str, targets_map in local_targets.items():
+        snapshot = {uid: dict(targets) for uid, targets in user_targets.items()}
+
+    for uid_str, targets_map in snapshot.items():
         try:
             user_id = int(uid_str)
         except (TypeError, ValueError):
             continue
-        # fetch user for mention and DM
+        # fetch user
         try:
             user = await bot.fetch_user(user_id)
         except discord.NotFound:
-            logger.warning("User %s not found", uid_str)
+            logger.warning("User not found: %s", uid_str)
             continue
         except Exception as e:
-            logger.warning("Failed to fetch user %s: %s", uid_str, e)
+            logger.warning("Failed fetch_user %s: %s", uid_str, e)
             continue
 
         for sym, info in list(targets_map.items()):
@@ -508,57 +506,57 @@ async def check_loop():
 
             # alert condition: price <= target (as requested)
             if price <= target_price:
-                # remove previous message if any
-                prev_msg = last_alerts.get(uid_str, {}).get(sym)
-                if prev_msg:
+                # delete previous alert message if any
+                prev = last_alerts.get(uid_str, {}).get(sym)
+                if prev:
                     try:
-                        await prev_msg.delete()
+                        await prev.delete()
                     except discord.NotFound:
                         pass
                     except discord.Forbidden:
                         pass
                     except Exception as e:
-                        logger.debug("Failed deleting prev message: %s", e)
+                        logger.debug("Failed deleting previous alert: %s", e)
 
-                # build embed
+                # build embed (mention included to cause notification when in channel)
                 embed = discord.Embed(
                     title=f"🔔 แจ้งเตือนหุ้น {sym}",
                     description=f"{user.mention}\nราคาปัจจุบัน **{fmt_price(price)}** ต่ำกว่าหรือเท่ากับเป้า **{fmt_price(target_price)}**",
                     color=discord.Color.red()
                 )
                 embed.set_footer(text=f"แจ้งเตือนอัตโนมัติ ทุก {CHECK_INTERVAL_MINUTES} นาที")
-                view = StockAlertView(user_id, sym)
 
+                view = StockAlertView(user_id, sym)
                 sent_msg = None
-                # send DM or channel
+
+                # send DM or channel (prefer channel if dm_flag False and channel_id exists)
                 if dm_flag:
                     try:
                         sent_msg = await user.send(embed=embed, view=view)
                     except discord.Forbidden:
-                        # fallback to channel if provided
+                        logger.warning("Cannot DM user %s - will fallback to channel if provided", uid_str)
                         if ch_id:
                             ch = bot.get_channel(ch_id)
                             if ch and isinstance(ch, discord.TextChannel):
                                 try:
                                     sent_msg = await ch.send(content=f"{user.mention}", embed=embed, view=view)
                                 except Exception as e:
-                                    logger.warning("Failed sending fallback channel msg: %s", e)
-                        else:
-                            logger.warning("Cannot DM user %s and no fallback channel", uid_str)
+                                    logger.warning("Fallback channel send failed: %s", e)
                 else:
-                    # send to stored channel if possible else try DM
                     if ch_id:
                         ch = bot.get_channel(ch_id)
                         if ch and isinstance(ch, discord.TextChannel):
                             try:
                                 sent_msg = await ch.send(content=f"{user.mention}", embed=embed, view=view)
                             except Exception as e:
-                                logger.warning("Failed send to channel %s: %s", ch_id, e)
+                                logger.warning("Send to channel failed: %s", e)
+                                # fallback to DM
                                 try:
                                     sent_msg = await user.send(embed=embed, view=view)
                                 except Exception as e2:
                                     logger.warning("Fallback DM failed: %s", e2)
                         else:
+                            # fallback DM
                             try:
                                 sent_msg = await user.send(embed=embed, view=view)
                             except Exception as e:
@@ -567,9 +565,9 @@ async def check_loop():
                         try:
                             sent_msg = await user.send(embed=embed, view=view)
                         except Exception as e:
-                            logger.warning("Failed send DM: %s", e)
+                            logger.warning("Send DM failed: %s", e)
 
-                # store last alert
+                # save last alert message for deletion next time
                 if sent_msg:
                     last_alerts.setdefault(uid_str, {})[sym] = sent_msg
 
@@ -581,4 +579,4 @@ if __name__ == "__main__":
         logger.error("DISCORD_TOKEN not set in environment")
         raise SystemExit("DISCORD_TOKEN required")
     load_data()
-    bot.run(DISCORD_TOKEN)ORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
