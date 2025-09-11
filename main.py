@@ -47,6 +47,7 @@ def get_price(symbol: str):
     except:
         return None
 
+# ===== Support / Resistance =====
 def calc_support(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
@@ -69,6 +70,28 @@ def calc_support(symbol: str):
     except:
         return None
 
+def calc_resistance(symbol: str):
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="60d")
+        if data.empty or len(data)<20: return None
+        high5 = data["High"][-5:].max()
+        high10 = data["High"][-10:].max()
+        high20 = data["High"][-20:].max()
+        ma20 = data["Close"][-20:].mean()
+        ma50 = data["Close"][-50:].mean() if len(data)>=50 else ma20
+        std20 = data["Close"][-20:].std()
+        current = data["Close"][-1]
+        vol_factor = std20 / current
+        trend = 0.01 if ma20>ma50 else -0.01
+        last_gain = (data["Close"][-1]-data["Open"][-1])/data["Open"][-1]
+        gap = 0.01 if last_gain>0.02 else 0
+        weighted_high = (high5*0.4 + high10*0.3 + high20*0.3)
+        resistance = weighted_high * (1 + vol_factor*0.5 + trend + gap)
+        return round(resistance,2)
+    except:
+        return None
+
 # ===== Buttons =====
 class StockButtons(discord.ui.View):
     def __init__(self, stock, user_id):
@@ -80,8 +103,10 @@ class StockButtons(discord.ui.View):
     async def check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         price = get_price(self.stock)
         support = calc_support(self.stock)
+        resistance = calc_resistance(self.stock)
         msg = f"💰 ราคาปัจจุบัน `{self.stock}` = {price:.2f}" if price else "⚠️ ไม่สามารถดึงราคาได้"
         if support: msg += f" | 📉 แนวรับ ≈ {support}"
+        if resistance: msg += f" | 📈 แนวต้าน ≈ {resistance}"
         await interaction.response.send_message(msg, ephemeral=True)
 
     @discord.ui.button(label="❌ ลบเป้า", style=discord.ButtonStyle.danger)
@@ -117,8 +142,10 @@ async def check_stocks(interaction: discord.Interaction):
     for stock, info in targets[user_id].items():
         price = get_price(stock)
         support = calc_support(stock)
+        resistance = calc_resistance(stock)
         msg = f"🎯 เป้าหมาย: {info['target']} | 💰 ปัจจุบัน: {price:.2f}" if price else "⚠️ ไม่สามารถดึงราคาได้"
         if support: msg += f" | 📉 แนวรับ: {support}"
+        if resistance: msg += f" | 📈 แนวต้าน: {resistance}"
         embed.add_field(name=stock, value=msg, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -144,10 +171,12 @@ async def check_loop():
         for stock, info in list(stocks.items()):
             price = get_price(stock)
             support = calc_support(stock)
+            resistance = calc_resistance(stock)
             if price and price <= info["target"]:
                 try:
                     content = f"📢 <@{user_id}> หุ้น `{stock}` ถึงเป้าหมายแล้ว!\n💰 ราคาปัจจุบัน: {price:.2f}"
                     if support: content += f" | 📉 แนวรับ ≈ {support}"
+                    if resistance: content += f" | 📈 แนวต้าน ≈ {resistance}"
                     view = StockButtons(stock, user_id)
                     if info["dm"]:
                         channel = await user.create_dm()
