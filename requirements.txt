@@ -4,3 +4,8 @@ Flask
 yfinance
 requests
 discord.py
+yfinance
+pandas
+numpy
+requests
+discord.py
