@@ -29,7 +29,7 @@ def load_data():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 targets = json.load(f)
         except Exception as e:
-            logger.error(f"Load data error: {e}")
+            logger.error(f"เกิดข้อผิดพลาดในการโหลดข้อมูล: {e}")
             targets = {}
     else:
         targets = {}
@@ -39,7 +39,7 @@ def save_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(targets, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Save data error: {e}")
+        logger.error(f"เกิดข้อผิดพลาดในการบันทึกข้อมูล: {e}")
 
 # =================== Stock Price ===================
 def get_price(symbol: str):
@@ -49,7 +49,7 @@ def get_price(symbol: str):
         if data.empty: return None
         return float(data["Close"].iloc[-1])
     except Exception as e:
-        logger.error(f"Get price error ({symbol}): {e}")
+        logger.error(f"เกิดข้อผิดพลาดในการดึงราคาหุ้น ({symbol}): {e}")
         return None
 
 # =================== Support / Resistance ===================
@@ -73,7 +73,7 @@ def calc_support(symbol: str):
         support = weighted_low * (1 - vol_factor*0.5 + trend - gap)
         return round(support,2)
     except Exception as e:
-        logger.error(f"Calc support error ({symbol}): {e}")
+        logger.error(f"เกิดข้อผิดพลาดในการคำนวณแนวรับ ({symbol}): {e}")
         return None
 
 def calc_resistance(symbol: str):
@@ -96,7 +96,7 @@ def calc_resistance(symbol: str):
         resistance = weighted_high * (1 + vol_factor*0.5 + trend + gap)
         return round(resistance,2)
     except Exception as e:
-        logger.error(f"Calc resistance error ({symbol}): {e}")
+        logger.error(f"เกิดข้อผิดพลาดในการคำนวณแนวต้าน ({symbol}): {e}")
         return None
 
 # =================== Buttons ===================
@@ -106,69 +106,69 @@ class StockButtons(discord.ui.View):
         self.stock = stock
         self.user_id = user_id
 
-    @discord.ui.button(label="📊 Check Price", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="📊 เช็คราคา", style=discord.ButtonStyle.primary)
     async def check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         price = get_price(self.stock)
         support = calc_support(self.stock)
         resistance = calc_resistance(self.stock)
-        msg = f"💰 Current Price `{self.stock}` = {price:.2f}" if price else "⚠️ Price unavailable"
-        if support: msg += f" | 📉 Support ≈ {support}"
-        if resistance: msg += f" | 📈 Resistance ≈ {resistance}"
+        msg = f"💰 ราคาปัจจุบัน `{self.stock}` = {price:.2f}" if price else "⚠️ ไม่สามารถดึงราคาหุ้นได้"
+        if support: msg += f" | 📉 แนวรับ ≈ {support}"
+        if resistance: msg += f" | 📈 แนวต้าน ≈ {resistance}"
         await interaction.response.send_message(msg, ephemeral=True)
 
-    @discord.ui.button(label="❌ Delete Target", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="❌ ลบเป้าหมาย", style=discord.ButtonStyle.danger)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
         if user_id in targets and self.stock in targets[user_id]:
             del targets[user_id][self.stock]
             save_data()
-            await interaction.response.send_message(f"🗑️ Deleted target `{self.stock}` successfully", ephemeral=True)
+            await interaction.response.send_message(f"🗑️ ลบเป้าหมาย `{self.stock}` เรียบร้อยแล้ว", ephemeral=True)
         else:
-            await interaction.response.send_message("⚠️ You have no target for this stock", ephemeral=True)
+            await interaction.response.send_message("⚠️ คุณยังไม่มีเป้าหมายสำหรับหุ้นนี้", ephemeral=True)
 
 # =================== Slash Commands ===================
-@tree.command(name="set", description="Set target stock price")
-@app_commands.describe(stock="Stock symbol e.g., AAPL or PTT.BK", target="Target price", dm="Send DM or channel")
+@tree.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
+@app_commands.describe(stock="สัญลักษณ์หุ้น เช่น AAPL หรือ PTT.BK", target="ราคาที่ตั้งเป้าหมาย", dm="ส่ง DM หรือโพสต์ใน Channel")
 async def set_stock(interaction: discord.Interaction, stock: str, target: float, dm: bool=False):
     user_id = str(interaction.user.id)
     if user_id not in targets: targets[user_id] = {}
     targets[user_id][stock.upper()] = {"target": target, "dm": dm, "last_msg": None}
     save_data()
     await interaction.response.send_message(
-        f"✅ Target for `{stock.upper()}` set at {target} {'(DM)' if dm else '(Channel)'}", ephemeral=True
+        f"✅ ตั้งเป้าหมายหุ้น `{stock.upper()}` ที่ {target} {'(DM)' if dm else '(โพสต์ใน Channel)'}", ephemeral=True
     )
 
-@tree.command(name="check", description="Check your stock targets")
+@tree.command(name="check", description="ตรวจสอบเป้าหมายหุ้นของคุณ")
 async def check_stocks(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if user_id not in targets or not targets[user_id]:
-        await interaction.response.send_message("ℹ️ You have no stock targets", ephemeral=True)
+        await interaction.response.send_message("ℹ️ คุณยังไม่ได้ตั้งเป้าหมายหุ้นใดๆ", ephemeral=True)
         return
-    embed = discord.Embed(title="📊 Your Stock Targets", color=discord.Color.blue())
+    embed = discord.Embed(title="📊 เป้าหมายหุ้นของคุณ", color=discord.Color.blue())
     for stock, info in targets[user_id].items():
         price = get_price(stock)
         support = calc_support(stock)
         resistance = calc_resistance(stock)
-        msg = f"🎯 Target: {info['target']} | 💰 Current: {price:.2f}" if price else "⚠️ Price unavailable"
-        if support: msg += f" | 📉 Support: {support}"
-        if resistance: msg += f" | 📈 Resistance: {resistance}"
+        msg = f"🎯 เป้าหมาย: {info['target']} | 💰 ปัจจุบัน: {price:.2f}" if price else "⚠️ ไม่สามารถดึงราคาหุ้นได้"
+        if support: msg += f" | 📉 แนวรับ: {support}"
+        if resistance: msg += f" | 📈 แนวต้าน: {resistance}"
         embed.add_field(name=stock, value=msg, inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True, view=StockButtons(stock, user_id))
 
-@tree.command(name="all", description="See all stock targets")
+@tree.command(name="all", description="ดูเป้าหมายหุ้นทั้งหมด")
 async def all_stocks(interaction: discord.Interaction):
     if not targets:
-        await interaction.response.send_message("ℹ️ No targets set yet", ephemeral=True)
+        await interaction.response.send_message("ℹ️ ยังไม่มีการตั้งเป้าหมายหุ้นใดๆ", ephemeral=True)
         return
-    embed = discord.Embed(title="📢 All Stock Targets", color=discord.Color.green())
+    embed = discord.Embed(title="📢 เป้าหมายหุ้นทั้งหมด", color=discord.Color.green())
     for user_id, stocks in targets.items():
         try:
             user = await bot.fetch_user(int(user_id))
         except: user = None
         for stock, info in stocks.items():
             uname = user.display_name if user else user_id
-            embed.add_field(name=f"{stock} (by {uname})",
-                            value=f"🎯 Target: {info['target']} | DM: {'✅' if info['dm'] else '❌'}",
+            embed.add_field(name=f"{stock} (โดย {uname})",
+                            value=f"🎯 เป้าหมาย: {info['target']} | DM: {'✅' if info['dm'] else '❌'}",
                             inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -185,9 +185,9 @@ async def check_loop():
             resistance = calc_resistance(stock)
             if price and price <= info["target"]:
                 try:
-                    content = f"📢 <@{user_id}> `{stock}` reached target!\n💰 Current: {price:.2f}"
-                    if support: content += f" | 📉 Support ≈ {support}"
-                    if resistance: content += f" | 📈 Resistance ≈ {resistance}"
+                    content = f"📢 <@{user_id}> หุ้น `{stock}` ถึงเป้าหมายแล้ว!\n💰 ราคาปัจจุบัน: {price:.2f}"
+                    if support: content += f" | 📉 แนวรับ ≈ {support}"
+                    if resistance: content += f" | 📈 แนวต้าน ≈ {resistance}"
                     view = StockButtons(stock, user_id)
                     last_msg_id = info.get("last_msg")
                     if last_msg_id:
@@ -203,7 +203,7 @@ async def check_loop():
                     targets[user_id][stock]["last_msg"] = str(msg.id)
                     save_data()
                 except Exception as e:
-                    logger.error(f"Alert failed for {stock}: {e}")
+                    logger.error(f"เกิดข้อผิดพลาดในการแจ้งเตือน {stock}: {e}")
 
 # =================== Bot Ready ===================
 @bot.event
@@ -211,6 +211,6 @@ async def on_ready():
     load_data()
     await tree.sync()
     check_loop.start()
-    logger.info("📈 Bot ready — checking every 5 minutes")
+    logger.info("📈 บอทพร้อมใช้งาน — ตรวจสอบทุก 5 นาที")
 
 bot.run(DISCORD_TOKEN)
