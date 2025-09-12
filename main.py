@@ -10,7 +10,6 @@ import statistics
 import concurrent.futures
 
 # --- Setup Logging ---
-# Set logging level to WARNING to hide INFO messages, and only show warnings and errors.
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("stockbot")
 
@@ -47,36 +46,70 @@ def fetch_price_blocking(symbol: str):
         logger.warning(f"ไม่สามารถดึงราคาหุ้น {symbol}: {e}")
         return None
 
-async def async_fetch_support_resistance(symbol: str):
-    loop = asyncio.get_running_loop()
-    try:
-        return await loop.run_in_executor(executor, fetch_support_resistance_blocking, symbol)
-    except Exception as e:
-        logger.error(f"Error fetching support/resistance for {symbol}: {e}")
-        return None, None
-
-def fetch_support_resistance_blocking(symbol: str):
-    """Blocking function to fetch a stock's support and resistance levels."""
+def fetch_historical_data_blocking(symbol: str, period="6mo", interval="1d"):
     try:
         ticker = yf.Ticker(symbol)
-        data = ticker.history(period="6mo", interval="1d")
-        if data.empty:
-            return None, None
-        closes = data["Close"].tolist()
+        data = ticker.history(period=period, interval=interval)
+        return data
+    except Exception as e:
+        logger.warning(f"ไม่สามารถดึงข้อมูลในอดีตของ {symbol}: {e}")
+        return None
+
+async def async_fetch_technical_levels(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, calculate_technical_levels, symbol)
+    except Exception as e:
+        logger.error(f"Error calculating technical levels for {symbol}: {e}")
+        return None
+
+def calculate_technical_levels(symbol: str):
+    data = fetch_historical_data_blocking(symbol, period="3mo", interval="1d")
+    if data is None or data.empty:
+        return None
+
+    try:
+        # --- Pivot Points ---
+        last_day = data.iloc[-1]
+        p_point = (last_day['High'] + last_day['Low'] + last_day['Close']) / 3
+        s1_pivot = (2 * p_point) - last_day['High']
+        r1_pivot = (2 * p_point) - last_day['Low']
+        
+        # --- Fibonacci Retracement ---
+        recent_high = data['High'].iloc[-20:].max()
+        recent_low = data['Low'].iloc[-20:].min()
+        diff = recent_high - recent_low
+        
+        s1_fib = recent_high - 0.382 * diff
+        s2_fib = recent_high - 0.618 * diff
+        r1_fib = recent_low + 0.382 * diff
+        r2_fib = recent_low + 0.618 * diff
+
+        # --- Average and Standard Deviation ---
+        closes = data['Close'].tolist()
         if not closes:
-            return None, None
+            return None
         mean_price = statistics.mean(closes)
         std_price = statistics.pstdev(closes)
-        pivot = (max(closes[-20:]) + min(closes[-20:]) + closes[-1]) / 3
-        support = round(pivot - std_price, 2)
-        resistance = round(pivot + std_price, 2)
-        return support, resistance
+        
+        s_std = round(mean_price - 1.5 * std_price, 2)
+        r_std = round(mean_price + 1.5 * std_price, 2)
+        
+        return {
+            "pivot_s1": round(s1_pivot, 2),
+            "pivot_r1": round(r1_pivot, 2),
+            "fib_s1": round(s1_fib, 2),
+            "fib_s2": round(s2_fib, 2),
+            "fib_r1": round(r1_fib, 2),
+            "fib_r2": round(r2_fib, 2),
+            "std_s": s_std,
+            "std_r": r_std
+        }
     except Exception as e:
         logger.warning(f"ไม่สามารถคำนวณแนวรับแนวต้าน {symbol}: {e}")
-        return None, None
+        return None
 
 # --- Custom Views and Modals ---
-
 class StockView(ui.View):
     def __init__(self, user_id: int, symbol: str, target_data: dict):
         super().__init__(timeout=None)
@@ -109,7 +142,7 @@ class StockView(ui.View):
             return
         
         status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= self.target else "📉 ต่ำกว่าเป้าหมาย"
-        support, resistance = await async_fetch_support_resistance(self.symbol)
+        levels = await async_fetch_technical_levels(self.symbol)
         
         embed = discord.Embed(
             title=f"หุ้น {self.symbol}",
@@ -119,8 +152,13 @@ class StockView(ui.View):
         embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
         embed.add_field(name="ราคาเป้าหมาย", value=f"**{self.target}** บาท", inline=True)
         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if self.trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
-        if support and resistance:
-            embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
+        
+        if levels:
+            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        
         embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -139,17 +177,22 @@ class StockView(ui.View):
     @ui.button(label="📊 แนวรับ/แนวต้าน", style=discord.ButtonStyle.success)
     async def support_resistance(self, interaction: Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True)
-        support, resistance = await async_fetch_support_resistance(self.symbol)
-        if support is None:
+        levels = await async_fetch_technical_levels(self.symbol)
+        
+        if levels is None:
             await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับแนวต้าน **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
             return
         
         embed = discord.Embed(
             title=f"แนวรับ/แนวต้าน {self.symbol}",
-            description=f"แนวรับ ≈ **{support}** บาท\nแนวต้าน ≈ **{resistance}** บาท",
             color=0x1abc9c,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
+        support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+        resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+        embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+        embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมายหุ้น"):
@@ -204,8 +247,6 @@ class StockBot(commands.Bot):
 
     @tasks.loop(minutes=5)
     async def auto_check(self):
-        # This will not print to the console because the logging level is set to WARNING
-        # logger.info("เริ่มการตรวจสอบราคาหุ้นอัตโนมัติ...") 
         for uid, targets in list(user_targets.items()):
             for stock, data in list(targets.items()):
                 target = data.get('target')
@@ -235,7 +276,7 @@ class StockBot(commands.Bot):
                                 logger.info(f"ไม่สามารถลบข้อความเก่าได้ (อาจถูกลบไปแล้ว): {uid}, {stock}")
                                 pass
                         
-                        support, resistance = await async_fetch_support_resistance(stock)
+                        levels = await async_fetch_technical_levels(stock)
                         
                         embed = discord.Embed(
                             title="📢 แจ้งเตือน: ราคาหุ้นถึงเป้าหมายแล้ว!",
@@ -246,8 +287,11 @@ class StockBot(commands.Bot):
                         embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
                         embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
                         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
-                        if support and resistance:
-                            embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
+                        if levels:
+                            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+                            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+                            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+                            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
                         
                         view = StockView(uid, stock, data)
                         method = user_dm_preference.get(uid, "dm")
@@ -265,8 +309,6 @@ class StockBot(commands.Bot):
                         
                         if sent_message:
                             user_messages[(uid, stock)] = sent_message
-                            # This will not print to the console
-                            # logger.info(f"ส่งแจ้งเตือนสำหรับ {stock} ถึง {user.name} แล้ว")
 
                     except Exception as e:
                         logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
@@ -332,13 +374,16 @@ async def check_stock_cmd(interaction: Interaction, stock: str):
         trigger_type = target_data['trigger_type']
         
         status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= target else "📉 ต่ำกว่าเป้าหมาย"
-        support, resistance = await async_fetch_support_resistance(stock)
+        levels = await async_fetch_technical_levels(stock)
         
         embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
         
-        if support and resistance:
-            embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
+        if levels:
+            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
         embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
         view = StockView(uid, stock, target_data)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -378,32 +423,32 @@ async def delete_target_cmd(interaction: Interaction, stock: str):
     else:
         await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้สำหรับหุ้นนี้", ephemeral=True)
 
-@stock_group.command(name="support", description="ดูแนวรับหุ้น")
-@app_commands.describe(stock="ชื่อหุ้นที่จะดูแนวรับ")
-async def support_cmd(interaction: Interaction, stock: str):
+@stock_group.command(name="levels", description="ดูแนวรับและแนวต้านของหุ้น (หลายมุมมอง)")
+@app_commands.describe(stock="ชื่อหุ้นที่จะดูข้อมูล")
+async def levels_cmd(interaction: Interaction, stock: str):
     await interaction.response.defer(ephemeral=True)
     stock = stock.upper()
-    support, _ = await async_fetch_support_resistance(stock)
+    levels = await async_fetch_technical_levels(stock)
     
-    if support is None:
-        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับ **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+    if levels is None:
+        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับ/แนวต้าน **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
         return
-        
-    await interaction.followup.send(f"📉 แนวรับ **{stock}** ≈ **{support}** บาท", ephemeral=True)
-
-@stock_group.command(name="resistance", description="ดูแนวต้านหุ้น")
-@app_commands.describe(stock="ชื่อหุ้นที่จะดูแนวต้าน")
-async def resistance_cmd(interaction: Interaction, stock: str):
-    await interaction.response.defer(ephemeral=True)
-    stock = stock.upper()
-    _, resistance = await async_fetch_support_resistance(stock)
     
-    if resistance is None:
-        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวต้าน **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
-        return
-        
-    await interaction.followup.send(f"📈 แนวต้าน **{stock}** ≈ **{resistance}** บาท", ephemeral=True)
-
+    embed = discord.Embed(
+        title=f"แนวรับและแนวต้าน **{stock}** (หลายมุมมอง)",
+        color=0x1abc9c,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    
+    support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+    resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+    
+    embed.add_field(name="แนวรับ 📉", value=support_levels, inline=False)
+    embed.add_field(name="แนวต้าน 📈", value=resistance_levels, inline=False)
+    
+    embed.set_footer(text="คำนวณจากข้อมูลย้อนหลัง 3 เดือน")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
