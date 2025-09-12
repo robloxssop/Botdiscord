@@ -8,7 +8,7 @@ from discord import app_commands, ui, Interaction
 import yfinance as yf
 import statistics
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stockbot")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -42,10 +42,11 @@ def fetch_support_resistance(symbol: str):
         if data.empty:
             return None, None
         closes = data["Close"].tolist()
-        avg = statistics.mean(closes)
-        std = statistics.pstdev(closes)
-        support = round(avg - std, 2)
-        resistance = round(avg + std, 2)
+        mean_price = statistics.mean(closes)
+        std_price = statistics.pstdev(closes)
+        pivot = (max(closes[-20:]) + min(closes[-20:]) + closes[-1]) / 3
+        support = round(pivot - std_price, 2)
+        resistance = round(pivot + std_price, 2)
         return support, resistance
     except Exception as e:
         logger.warning(f"ไม่สามารถคำนวณแนวรับแนวต้าน {symbol}: {e}")
@@ -176,6 +177,37 @@ async def show_targets(interaction: Interaction):
         msg += f"- {s}: {t} บาท\n"
     await interaction.response.send_message(msg, ephemeral=True)
 
+@tree.command(name="delete", description="ลบเป้าหมายหุ้น")
+@app_commands.describe(stock="หุ้นที่จะลบ")
+async def delete_target_cmd(interaction: Interaction, stock: str):
+    uid = interaction.user.id
+    stock = stock.upper()
+    if uid in user_targets and stock in user_targets[uid]:
+        del user_targets[uid][stock]
+        await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น {stock} เรียบร้อยแล้ว", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้", ephemeral=True)
+
+@tree.command(name="support", description="ดูแนวรับหุ้น")
+@app_commands.describe(stock="หุ้นที่จะดูแนวรับ")
+async def support_cmd(interaction: Interaction, stock: str):
+    stock = stock.upper()
+    support, _ = fetch_support_resistance(stock)
+    if support is None:
+        await interaction.response.send_message(f"❌ ไม่สามารถคำนวณแนวรับ {stock} ได้", ephemeral=True)
+        return
+    await interaction.response.send_message(f"📉 แนวรับ {stock} ≈ {support} บาท", ephemeral=True)
+
+@tree.command(name="resistance", description="ดูแนวต้านหุ้น")
+@app_commands.describe(stock="หุ้นที่จะดูแนวต้าน")
+async def resistance_cmd(interaction: Interaction, stock: str):
+    stock = stock.upper()
+    _, resistance = fetch_support_resistance(stock)
+    if resistance is None:
+        await interaction.response.send_message(f"❌ ไม่สามารถคำนวณแนวต้าน {stock} ได้", ephemeral=True)
+        return
+    await interaction.response.send_message(f"📈 แนวต้าน {stock} ≈ {resistance} บาท", ephemeral=True)
+
 @tasks.loop(minutes=5)
 async def auto_check():
     for uid, targets in list(user_targets.items()):
@@ -221,7 +253,7 @@ async def on_ready():
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             await tree.sync(guild=guild)
-            logger.info("คำสั่ง Slash ถูกซิงค์แบบระบุเซิร์ฟเวอร์")
+            logger.info("คำสั่ง Slash ถูกซิงค์แบบเซิร์ฟเวอร์")
         else:
             await tree.sync()
             logger.info("คำสั่ง Slash ถูกซิงค์แบบ Global")
