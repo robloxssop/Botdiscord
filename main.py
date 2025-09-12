@@ -4,27 +4,39 @@ import logging
 import datetime
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands, ui, Interaction
+from discord import app_commands, ui, Interaction, embeds
 import yfinance as yf
 import statistics
+import concurrent.futures
 
-logging.basicConfig(level=logging.INFO)
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("stockbot")
 
+# --- Environment Variables ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
 DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
+# --- Global Data Storage (Consider a database for persistence) ---
 user_targets = {}
 user_messages = {}
 user_dm_preference = {}
 
-def fetch_price(symbol: str):
+# --- Asynchronous Wrappers for Blocking I/O ---
+# Use a thread pool executor to run blocking yfinance calls without blocking the main event loop
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
+async def async_fetch_price(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, fetch_price_blocking, symbol)
+    except Exception as e:
+        logger.error(f"Error fetching price for {symbol}: {e}")
+        return None
+
+def fetch_price_blocking(symbol: str):
+    """Blocking function to fetch a stock's current price."""
     try:
         ticker = yf.Ticker(symbol)
         data = ticker.history(period="1d", interval="1m")
@@ -35,13 +47,24 @@ def fetch_price(symbol: str):
         logger.warning(f"ไม่สามารถดึงราคาหุ้น {symbol}: {e}")
         return None
 
-def fetch_support_resistance(symbol: str):
+async def async_fetch_support_resistance(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, fetch_support_resistance_blocking, symbol)
+    except Exception as e:
+        logger.error(f"Error fetching support/resistance for {symbol}: {e}")
+        return None, None
+
+def fetch_support_resistance_blocking(symbol: str):
+    """Blocking function to fetch a stock's support and resistance levels."""
     try:
         ticker = yf.Ticker(symbol)
         data = ticker.history(period="6mo", interval="1d")
         if data.empty:
             return None, None
         closes = data["Close"].tolist()
+        if not closes:
+            return None, None
         mean_price = statistics.mean(closes)
         std_price = statistics.pstdev(closes)
         pivot = (max(closes[-20:]) + min(closes[-20:]) + closes[-1]) / 3
@@ -51,6 +74,8 @@ def fetch_support_resistance(symbol: str):
     except Exception as e:
         logger.warning(f"ไม่สามารถคำนวณแนวรับแนวต้าน {symbol}: {e}")
         return None, None
+
+# --- Custom Views and Modals ---
 
 class StockView(ui.View):
     def __init__(self, user_id: int, symbol: str, target: float):
@@ -76,19 +101,26 @@ class StockView(ui.View):
 
     @ui.button(label="🔄 เช็คราคาใหม่", style=discord.ButtonStyle.primary)
     async def check_price(self, interaction: Interaction, button: ui.Button):
-        price = fetch_price(self.symbol)
+        await interaction.response.defer(ephemeral=True)
+        price = await async_fetch_price(self.symbol)
         if price is None:
-            await interaction.response.send_message(f"❌ ไม่สามารถดึงราคาของ {self.symbol} ได้", ephemeral=True)
+            await interaction.followup.send(f"❌ ไม่สามารถดึงราคาของ **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
             return
+        
         status = "📉 ต่ำกว่าเป้าหมาย" if price < self.target else "📈 สูงกว่าหรือเท่ากับเป้าหมาย"
-        support, resistance = fetch_support_resistance(self.symbol)
-        embed = discord.Embed(title=f"หุ้น {self.symbol}", color=0x3498db, timestamp=datetime.datetime.utcnow())
-        embed.add_field(name="ราคา", value=f"{price} บาท", inline=True)
-        embed.add_field(name="เป้าหมาย", value=f"{self.target} บาท", inline=True)
+        support, resistance = await async_fetch_support_resistance(self.symbol)
+        
+        embed = discord.Embed(
+            title=f"หุ้น {self.symbol}",
+            color=0x3498db,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+        embed.add_field(name="ราคาเป้าหมาย", value=f"**{self.target}** บาท", inline=True)
         if support and resistance:
             embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
-        embed.set_footer(text=status)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @ui.button(label="✏️ แก้ไขเป้าหมาย", style=discord.ButtonStyle.secondary)
     async def edit_target(self, interaction: Interaction, button: ui.Button):
@@ -98,172 +130,253 @@ class StockView(ui.View):
     async def delete_target(self, interaction: Interaction, button: ui.Button):
         if self.user_id in user_targets and self.symbol in user_targets[self.user_id]:
             del user_targets[self.user_id][self.symbol]
-            await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น {self.symbol} เรียบร้อยแล้ว", ephemeral=True)
+            await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{self.symbol}** เรียบร้อยแล้ว", ephemeral=True)
         else:
             await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้", ephemeral=True)
 
     @ui.button(label="📊 แนวรับ/แนวต้าน", style=discord.ButtonStyle.success)
     async def support_resistance(self, interaction: Interaction, button: ui.Button):
-        support, resistance = fetch_support_resistance(self.symbol)
+        await interaction.response.defer(ephemeral=True)
+        support, resistance = await async_fetch_support_resistance(self.symbol)
         if support is None:
-            await interaction.response.send_message(f"❌ ไม่สามารถคำนวณแนวรับแนวต้าน {self.symbol} ได้", ephemeral=True)
+            await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับแนวต้าน **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
             return
-        embed = discord.Embed(title=f"แนวรับ/แนวต้าน {self.symbol}", description=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", color=0x1abc9c, timestamp=datetime.datetime.utcnow())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        embed = discord.Embed(
+            title=f"แนวรับ/แนวต้าน {self.symbol}",
+            description=f"แนวรับ ≈ **{support}** บาท\nแนวต้าน ≈ **{resistance}** บาท",
+            color=0x1abc9c,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมายหุ้น"):
-    new_target = ui.TextInput(label="ราคาเป้าหมายใหม่", style=discord.TextStyle.short)
+    new_target = ui.TextInput(label="ราคาเป้าหมายใหม่", style=discord.TextStyle.short, placeholder="กรุณาใส่ราคาเป้าหมายเป็นตัวเลข")
     def __init__(self, user_id: int, symbol: str):
         super().__init__()
         self.user_id = user_id
         self.symbol = symbol
+        
     async def on_submit(self, interaction: Interaction):
         try:
             value = float(self.new_target.value)
         except ValueError:
-            await interaction.response.send_message("❌ กรุณากรอกราคาเป็นตัวเลข", ephemeral=True)
+            await interaction.response.send_message("❌ กรุณากรอกราคาเป็นตัวเลขที่ถูกต้อง", ephemeral=True)
             return
+        
         if self.user_id not in user_targets:
             user_targets[self.user_id] = {}
         user_targets[self.user_id][self.symbol] = value
-        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ {self.symbol} ที่ {value} บาทเรียบร้อยแล้ว", ephemeral=True)
+        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาทเรียบร้อยแล้ว", ephemeral=True)
 
-@tree.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
-@app_commands.describe(stock="หุ้น เช่น AAPL หรือ PTT.BK", target="ราคาเป้าหมาย")
-async def set_target(interaction: Interaction, stock: str, target: float):
+# --- Bot Class and Commands ---
+class StockBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def on_ready(self):
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("คำสั่ง Slash ถูกซิงค์แบบเซิร์ฟเวอร์")
+            else:
+                await self.tree.sync()
+                logger.info("คำสั่ง Slash ถูกซิงค์แบบ Global")
+        except Exception as e:
+            logger.error(f"ซิงค์คำสั่งล้มเหลว: {e}")
+        
+        self.auto_check.start()
+        logger.info(f"บอท {self.user.name} พร้อมใช้งานแล้ว - ตรวจสอบทุกๆ 5 นาที")
+
+    @tasks.loop(minutes=5)
+    async def auto_check(self):
+        logger.info("เริ่มการตรวจสอบราคาหุ้นอัตโนมัติ...")
+        for uid, targets in list(user_targets.items()):
+            for stock, target in list(targets.items()):
+                price = await async_fetch_price(stock)
+                if price is None:
+                    continue
+                
+                # Notification logic: Trigger if price drops to or below the target
+                if price <= target:
+                    try:
+                        user = await self.fetch_user(uid)
+                        if user is None:
+                            continue
+                        
+                        # Clean up old message if it exists
+                        old_msg = user_messages.get((uid, stock))
+                        if old_msg:
+                            try:
+                                await old_msg.delete()
+                            except (discord.NotFound, discord.Forbidden):
+                                logger.info(f"ไม่สามารถลบข้อความเก่าได้ (อาจถูกลบไปแล้ว): {uid}, {stock}")
+                                pass
+                        
+                        support, resistance = await async_fetch_support_resistance(stock)
+                        
+                        embed = discord.Embed(
+                            title="📢 แจ้งเตือน: ราคาหุ้นถึงเป้าหมายแล้ว!",
+                            color=0xe67e22,
+                            timestamp=datetime.datetime.now(datetime.timezone.utc)
+                        )
+                        embed.add_field(name="หุ้น", value=f"**{stock}**", inline=True)
+                        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+                        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+                        if support and resistance:
+                            embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
+                        
+                        view = StockView(uid, stock, target)
+                        method = user_dm_preference.get(uid, "dm")
+                        
+                        sent_message = None
+                        if method == "dm":
+                            sent_message = await user.send(embed=embed, view=view)
+                        else:
+                            channel = self.get_channel(DEFAULT_CHANNEL_ID)
+                            if channel:
+                                sent_message = await channel.send(f"แจ้งเตือนสำหรับ {user.mention}", embed=embed, view=view)
+                            else:
+                                logger.warning(f"ไม่พบ channel ID: {DEFAULT_CHANNEL_ID}")
+                                continue
+                        
+                        if sent_message:
+                            user_messages[(uid, stock)] = sent_message
+                            logger.info(f"ส่งแจ้งเตือนสำหรับ {stock} ถึง {user.name} แล้ว")
+
+                    except Exception as e:
+                        logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
+
+# --- Slash Command Group ---
+stock_group = app_commands.Group(name="stock", description="คำสั่งสำหรับจัดการข้อมูลหุ้น")
+
+@stock_group.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
+@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK", target="ราคาเป้าหมาย")
+async def set_target_cmd(interaction: Interaction, stock: str, target: float):
     uid = interaction.user.id
     stock = stock.upper()
+    
+    # Check if the stock symbol is valid before saving it
+    price = await async_fetch_price(stock)
+    if price is None:
+        await interaction.response.send_message(f"❌ ไม่พบหุ้นชื่อ **{stock}** หรือข้อมูลไม่ถูกต้อง กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+        return
+
     if uid not in user_targets:
         user_targets[uid] = {}
     user_targets[uid][stock] = target
-    embed = discord.Embed(title="✅ ตั้งเป้าหมายสำเร็จ", description=f"{interaction.user.mention} ตั้งเป้าหมายหุ้น **{stock}** ที่ {target} บาท", color=0x2ecc71, timestamp=datetime.datetime.utcnow())
+    
+    embed = discord.Embed(
+        title="✅ ตั้งเป้าหมายสำเร็จ",
+        description=f"{interaction.user.mention} ตั้งเป้าหมายหุ้น **{stock}** ที่ **{target}** บาท",
+        color=0x2ecc71,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
     view = StockView(uid, stock, target)
     await interaction.response.send_message(embed=embed, view=view)
 
-@tree.command(name="check", description="เช็คราคาหุ้นปัจจุบัน")
-@app_commands.describe(stock="หุ้น เช่น AAPL หรือ PTT.BK")
-async def check_stock(interaction: Interaction, stock: str):
+@stock_group.command(name="check", description="เช็คราคาหุ้นปัจจุบัน")
+@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
+async def check_stock_cmd(interaction: Interaction, stock: str):
+    await interaction.response.defer(ephemeral=True)
     stock = stock.upper()
-    price = fetch_price(stock)
+    price = await async_fetch_price(stock)
+    
     if price is None:
-        await interaction.response.send_message(f"❌ ไม่สามารถดึงราคาหุ้น {stock} ได้", ephemeral=True)
+        await interaction.followup.send(f"❌ ไม่สามารถดึงราคาหุ้น **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
         return
+    
     uid = interaction.user.id
     target = user_targets.get(uid, {}).get(stock)
+    
+    embed = discord.Embed(
+        title=f"ข้อมูลหุ้น {stock}",
+        color=0x3498db,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+    
     if target:
         status = "📉 ต่ำกว่าเป้าหมาย" if price < target else "📈 สูงกว่าหรือเท่ากับเป้าหมาย"
-        support, resistance = fetch_support_resistance(stock)
-        embed = discord.Embed(title=f"หุ้น {stock}", color=0x3498db, timestamp=datetime.datetime.utcnow())
-        embed.add_field(name="ราคา", value=f"{price} บาท", inline=True)
-        embed.add_field(name="เป้าหมาย", value=f"{target} บาท", inline=True)
+        support, resistance = await async_fetch_support_resistance(stock)
+        
+        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
         if support and resistance:
             embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
-        embed.set_footer(text=status)
+        embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
         view = StockView(uid, stock, target)
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     else:
-        embed = discord.Embed(title=f"หุ้น {stock}", description=f"ราคา: {price} บาท\n(ยังไม่ได้ตั้งเป้าหมาย)", color=0x95a5a6, timestamp=datetime.datetime.utcnow())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.description = f"**ราคา: {price} บาท**\n(คุณยังไม่ได้ตั้งเป้าหมายสำหรับหุ้นนี้)"
+        embed.color = 0x95a5a6
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="targets", description="ดูเป้าหมายที่คุณตั้งไว้ทั้งหมด")
-async def show_targets(interaction: Interaction):
+@stock_group.command(name="list", description="ดูเป้าหมายที่คุณตั้งไว้ทั้งหมด")
+async def show_targets_cmd(interaction: Interaction):
     uid = interaction.user.id
     targets = user_targets.get(uid, {})
     if not targets:
         await interaction.response.send_message("❌ คุณยังไม่ได้ตั้งเป้าหมายหุ้นใด ๆ", ephemeral=True)
         return
-    msg = "📊 เป้าหมายหุ้นของคุณ:\n"
+        
+    embed = discord.Embed(
+        title="📊 เป้าหมายหุ้นของคุณ",
+        description="นี่คือรายการเป้าหมายหุ้นที่คุณตั้งไว้:",
+        color=0x3498db
+    )
     for s, t in targets.items():
-        msg += f"- {s}: {t} บาท\n"
-    await interaction.response.send_message(msg, ephemeral=True)
+        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{t}** บาท", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@tree.command(name="delete", description="ลบเป้าหมายหุ้น")
-@app_commands.describe(stock="หุ้นที่จะลบ")
+@stock_group.command(name="delete", description="ลบเป้าหมายหุ้น")
+@app_commands.describe(stock="ชื่อหุ้นที่จะลบ")
 async def delete_target_cmd(interaction: Interaction, stock: str):
     uid = interaction.user.id
     stock = stock.upper()
+    
     if uid in user_targets and stock in user_targets[uid]:
         del user_targets[uid][stock]
-        await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น {stock} เรียบร้อยแล้ว", ephemeral=True)
+        await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{stock}** เรียบร้อยแล้ว", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้", ephemeral=True)
+        await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้สำหรับหุ้นนี้", ephemeral=True)
 
-@tree.command(name="support", description="ดูแนวรับหุ้น")
-@app_commands.describe(stock="หุ้นที่จะดูแนวรับ")
+@stock_group.command(name="support", description="ดูแนวรับหุ้น")
+@app_commands.describe(stock="ชื่อหุ้นที่จะดูแนวรับ")
 async def support_cmd(interaction: Interaction, stock: str):
+    await interaction.response.defer(ephemeral=True)
     stock = stock.upper()
-    support, _ = fetch_support_resistance(stock)
+    support, _ = await async_fetch_support_resistance(stock)
+    
     if support is None:
-        await interaction.response.send_message(f"❌ ไม่สามารถคำนวณแนวรับ {stock} ได้", ephemeral=True)
+        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับ **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
         return
-    await interaction.response.send_message(f"📉 แนวรับ {stock} ≈ {support} บาท", ephemeral=True)
+        
+    await interaction.followup.send(f"📉 แนวรับ **{stock}** ≈ **{support}** บาท", ephemeral=True)
 
-@tree.command(name="resistance", description="ดูแนวต้านหุ้น")
-@app_commands.describe(stock="หุ้นที่จะดูแนวต้าน")
+@stock_group.command(name="resistance", description="ดูแนวต้านหุ้น")
+@app_commands.describe(stock="ชื่อหุ้นที่จะดูแนวต้าน")
 async def resistance_cmd(interaction: Interaction, stock: str):
+    await interaction.response.defer(ephemeral=True)
     stock = stock.upper()
-    _, resistance = fetch_support_resistance(stock)
+    _, resistance = await async_fetch_support_resistance(stock)
+    
     if resistance is None:
-        await interaction.response.send_message(f"❌ ไม่สามารถคำนวณแนวต้าน {stock} ได้", ephemeral=True)
+        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวต้าน **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
         return
-    await interaction.response.send_message(f"📈 แนวต้าน {stock} ≈ {resistance} บาท", ephemeral=True)
+        
+    await interaction.followup.send(f"📈 แนวต้าน **{stock}** ≈ **{resistance}** บาท", ephemeral=True)
 
-@tasks.loop(minutes=5)
-async def auto_check():
-    for uid, targets in list(user_targets.items()):
-        for stock, target in list(targets.items()):
-            price = fetch_price(stock)
-            if price is None:
-                continue
-            if price <= target:
-                try:
-                    user = await bot.fetch_user(uid)
-                    if user is None:
-                        continue
-                    old_msg = user_messages.get((uid, stock))
-                    if old_msg:
-                        try:
-                            await old_msg.delete()
-                        except:
-                            pass
-                    support, resistance = fetch_support_resistance(stock)
-                    embed = discord.Embed(title="📢 แจ้งเตือนหุ้น", color=0xe67e22, timestamp=datetime.datetime.utcnow())
-                    embed.add_field(name="หุ้น", value=stock, inline=True)
-                    embed.add_field(name="ราคา", value=f"{price} บาท", inline=True)
-                    embed.add_field(name="เป้าหมาย", value=f"{target} บาท", inline=True)
-                    if support and resistance:
-                        embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
-                    view = StockView(uid, stock, target)
-                    method = user_dm_preference.get(uid, "dm")
-                    if method == "dm":
-                        sent = await user.send(embed=embed, view=view)
-                    else:
-                        channel = bot.get_channel(DEFAULT_CHANNEL_ID)
-                        if channel:
-                            sent = await channel.send(embed=embed, view=view)
-                        else:
-                            continue
-                    user_messages[(uid, stock)] = sent
-                except Exception as e:
-                    logger.warning(f"แจ้งเตือน {stock} ให้ {uid} ไม่ได้: {e}")
-
-@bot.event
-async def on_ready():
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            await tree.sync(guild=guild)
-            logger.info("คำสั่ง Slash ถูกซิงค์แบบเซิร์ฟเวอร์")
-        else:
-            await tree.sync()
-            logger.info("คำสั่ง Slash ถูกซิงค์แบบ Global")
-    except Exception as e:
-        logger.error(f"ซิงค์คำสั่งล้มเหลว: {e}")
-    auto_check.start()
-    logger.info("บอทพร้อมใช้งานแล้ว — ตรวจสอบทุกๆ 5 นาที")
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("❌ กรุณาตั้งค่า DISCORD_TOKEN ใน Secrets/Environment Variables")
     else:
+        bot = StockBot()
+        bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
+
