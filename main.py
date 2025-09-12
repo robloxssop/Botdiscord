@@ -19,12 +19,13 @@ GUILD_ID = os.environ.get("GUILD_ID")
 DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 
 # --- Global Data Storage (Consider a database for persistence) ---
+# Store trigger_type along with target price
+# {user_id: {symbol: {'target': float, 'trigger_type': 'below' | 'above'}}}
 user_targets = {}
 user_messages = {}
 user_dm_preference = {}
 
 # --- Asynchronous Wrappers for Blocking I/O ---
-# Use a thread pool executor to run blocking yfinance calls without blocking the main event loop
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 async def async_fetch_price(symbol: str):
@@ -78,11 +79,12 @@ def fetch_support_resistance_blocking(symbol: str):
 # --- Custom Views and Modals ---
 
 class StockView(ui.View):
-    def __init__(self, user_id: int, symbol: str, target: float):
+    def __init__(self, user_id: int, symbol: str, target_data: dict):
         super().__init__(timeout=None)
         self.user_id = user_id
         self.symbol = symbol
-        self.target = target
+        self.target = target_data.get('target')
+        self.trigger_type = target_data.get('trigger_type', 'below')
 
     async def interaction_check(self, interaction: Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -107,7 +109,7 @@ class StockView(ui.View):
             await interaction.followup.send(f"❌ ไม่สามารถดึงราคาของ **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
             return
         
-        status = "📉 ต่ำกว่าเป้าหมาย" if price < self.target else "📈 สูงกว่าหรือเท่ากับเป้าหมาย"
+        status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= self.target else "📉 ต่ำกว่าเป้าหมาย"
         support, resistance = await async_fetch_support_resistance(self.symbol)
         
         embed = discord.Embed(
@@ -117,6 +119,7 @@ class StockView(ui.View):
         )
         embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
         embed.add_field(name="ราคาเป้าหมาย", value=f"**{self.target}** บาท", inline=True)
+        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if self.trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
         if support and resistance:
             embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
         embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
@@ -152,6 +155,8 @@ class StockView(ui.View):
 
 class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมายหุ้น"):
     new_target = ui.TextInput(label="ราคาเป้าหมายใหม่", style=discord.TextStyle.short, placeholder="กรุณาใส่ราคาเป้าหมายเป็นตัวเลข")
+    new_trigger_type = ui.TextInput(label="ประเภทการแจ้งเตือน (below/above)", style=discord.TextStyle.short, default="below")
+    
     def __init__(self, user_id: int, symbol: str):
         super().__init__()
         self.user_id = user_id
@@ -164,10 +169,16 @@ class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมาย�
             await interaction.response.send_message("❌ กรุณากรอกราคาเป็นตัวเลขที่ถูกต้อง", ephemeral=True)
             return
         
+        trigger = self.new_trigger_type.value.lower()
+        if trigger not in ['below', 'above']:
+            await interaction.response.send_message("❌ ประเภทการแจ้งเตือนไม่ถูกต้อง กรุณาใช้ 'below' หรือ 'above'", ephemeral=True)
+            return
+
         if self.user_id not in user_targets:
             user_targets[self.user_id] = {}
-        user_targets[self.user_id][self.symbol] = value
-        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาทเรียบร้อยแล้ว", ephemeral=True)
+        user_targets[self.user_id][self.symbol] = {'target': value, 'trigger_type': trigger}
+        
+        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา {trigger}) เรียบร้อยแล้ว", ephemeral=True)
 
 # --- Bot Class and Commands ---
 class StockBot(commands.Bot):
@@ -196,19 +207,26 @@ class StockBot(commands.Bot):
     async def auto_check(self):
         logger.info("เริ่มการตรวจสอบราคาหุ้นอัตโนมัติ...")
         for uid, targets in list(user_targets.items()):
-            for stock, target in list(targets.items()):
+            for stock, data in list(targets.items()):
+                target = data.get('target')
+                trigger_type = data.get('trigger_type', 'below')
+                
                 price = await async_fetch_price(stock)
                 if price is None:
                     continue
                 
-                # Notification logic: Trigger if price drops to or below the target
-                if price <= target:
+                should_notify = False
+                if trigger_type == 'below' and price <= target:
+                    should_notify = True
+                elif trigger_type == 'above' and price >= target:
+                    should_notify = True
+                
+                if should_notify:
                     try:
                         user = await self.fetch_user(uid)
                         if user is None:
                             continue
                         
-                        # Clean up old message if it exists
                         old_msg = user_messages.get((uid, stock))
                         if old_msg:
                             try:
@@ -227,10 +245,11 @@ class StockBot(commands.Bot):
                         embed.add_field(name="หุ้น", value=f"**{stock}**", inline=True)
                         embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
                         embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+                        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
                         if support and resistance:
                             embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
                         
-                        view = StockView(uid, stock, target)
+                        view = StockView(uid, stock, data)
                         method = user_dm_preference.get(uid, "dm")
                         
                         sent_message = None
@@ -255,12 +274,15 @@ class StockBot(commands.Bot):
 stock_group = app_commands.Group(name="stock", description="คำสั่งสำหรับจัดการข้อมูลหุ้น")
 
 @stock_group.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
-@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK", target="ราคาเป้าหมาย")
-async def set_target_cmd(interaction: Interaction, stock: str, target: float):
+@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK", target="ราคาเป้าหมาย", trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)")
+@app_commands.choices(trigger_type=[
+    app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
+    app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
+])
+async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below'):
     uid = interaction.user.id
     stock = stock.upper()
     
-    # Check if the stock symbol is valid before saving it
     price = await async_fetch_price(stock)
     if price is None:
         await interaction.response.send_message(f"❌ ไม่พบหุ้นชื่อ **{stock}** หรือข้อมูลไม่ถูกต้อง กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
@@ -268,15 +290,19 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float):
 
     if uid not in user_targets:
         user_targets[uid] = {}
-    user_targets[uid][stock] = target
+    
+    user_targets[uid][stock] = {'target': target, 'trigger_type': trigger_type}
     
     embed = discord.Embed(
         title="✅ ตั้งเป้าหมายสำเร็จ",
-        description=f"{interaction.user.mention} ตั้งเป้าหมายหุ้น **{stock}** ที่ **{target}** บาท",
+        description=f"{interaction.user.mention} ตั้งเป้าหมายหุ้น **{stock}**",
         color=0x2ecc71,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
-    view = StockView(uid, stock, target)
+    embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+    embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
+
+    view = StockView(uid, stock, user_targets[uid][stock])
     await interaction.response.send_message(embed=embed, view=view)
 
 @stock_group.command(name="check", description="เช็คราคาหุ้นปัจจุบัน")
@@ -291,7 +317,7 @@ async def check_stock_cmd(interaction: Interaction, stock: str):
         return
     
     uid = interaction.user.id
-    target = user_targets.get(uid, {}).get(stock)
+    target_data = user_targets.get(uid, {}).get(stock)
     
     embed = discord.Embed(
         title=f"ข้อมูลหุ้น {stock}",
@@ -300,15 +326,20 @@ async def check_stock_cmd(interaction: Interaction, stock: str):
     )
     embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
     
-    if target:
-        status = "📉 ต่ำกว่าเป้าหมาย" if price < target else "📈 สูงกว่าหรือเท่ากับเป้าหมาย"
+    if target_data:
+        target = target_data['target']
+        trigger_type = target_data['trigger_type']
+        
+        status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= target else "📉 ต่ำกว่าเป้าหมาย"
         support, resistance = await async_fetch_support_resistance(stock)
         
         embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
+        
         if support and resistance:
             embed.add_field(name="แนวรับ/แนวต้าน", value=f"แนวรับ ≈ {support} บาท\nแนวต้าน ≈ {resistance} บาท", inline=False)
         embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
-        view = StockView(uid, stock, target)
+        view = StockView(uid, stock, target_data)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     else:
         embed.description = f"**ราคา: {price} บาท**\n(คุณยังไม่ได้ตั้งเป้าหมายสำหรับหุ้นนี้)"
@@ -328,8 +359,9 @@ async def show_targets_cmd(interaction: Interaction):
         description="นี่คือรายการเป้าหมายหุ้นที่คุณตั้งไว้:",
         color=0x3498db
     )
-    for s, t in targets.items():
-        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{t}** บาท", inline=False)
+    for s, data in targets.items():
+        trigger_text = 'ต่ำกว่าหรือเท่ากับ' if data['trigger_type'] == 'below' else 'สูงกว่าหรือเท่ากับ'
+        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nแจ้งเตือนเมื่อราคา {trigger_text} เป้าหมาย", inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -379,4 +411,3 @@ if __name__ == "__main__":
         bot = StockBot()
         bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
-
