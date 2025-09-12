@@ -69,13 +69,11 @@ def calculate_technical_levels(symbol: str):
         return None
 
     try:
-        # --- Pivot Points ---
         last_day = data.iloc[-1]
         p_point = (last_day['High'] + last_day['Low'] + last_day['Close']) / 3
         s1_pivot = (2 * p_point) - last_day['High']
         r1_pivot = (2 * p_point) - last_day['Low']
         
-        # --- Fibonacci Retracement ---
         recent_high = data['High'].iloc[-20:].max()
         recent_low = data['Low'].iloc[-20:].min()
         diff = recent_high - recent_low
@@ -85,7 +83,6 @@ def calculate_technical_levels(symbol: str):
         r1_fib = recent_low + 0.382 * diff
         r2_fib = recent_low + 0.618 * diff
 
-        # --- Average and Standard Deviation ---
         closes = data['Close'].tolist()
         if not closes:
             return None
@@ -110,6 +107,7 @@ def calculate_technical_levels(symbol: str):
         return None
 
 # --- Custom Views and Modals ---
+
 class StockView(ui.View):
     def __init__(self, user_id: int, symbol: str, target_data: dict):
         super().__init__(timeout=None)
@@ -123,15 +121,6 @@ class StockView(ui.View):
             await interaction.response.send_message("❌ คุณไม่สามารถกดปุ่มของคนอื่นได้", ephemeral=True)
             return False
         return True
-
-    @ui.select(placeholder="เลือกวิธีแจ้งเตือน", options=[
-        discord.SelectOption(label="ส่ง DM", description="แจ้งเตือนแบบข้อความส่วนตัว", emoji="📩"),
-        discord.SelectOption(label="ส่ง Channel", description="แจ้งเตือนใน Channel ปกติ", emoji="📢")
-    ])
-    async def notification_method(self, interaction: Interaction, select: ui.Select):
-        choice = select.values[0]
-        user_dm_preference[self.user_id] = "dm" if choice == "ส่ง DM" else "channel"
-        await interaction.response.send_message(f"✅ ตั้งค่าแจ้งเตือนเป็น: {choice}", ephemeral=True)
 
     @ui.button(label="🔄 เช็คราคาใหม่", style=discord.ButtonStyle.primary)
     async def check_price(self, interaction: Interaction, button: ui.Button):
@@ -333,7 +322,9 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
 
     if uid not in user_targets:
         user_targets[uid] = {}
-    
+        # Set default DM preference for new users
+        user_dm_preference[uid] = "dm"
+
     user_targets[uid][stock] = {'target': target, 'trigger_type': trigger_type}
     
     embed = discord.Embed(
@@ -344,6 +335,8 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
     )
     embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
     embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
+    embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**ข้อความส่วนตัว (DM)**\n(หากต้องการเปลี่ยน ต้องลบเป้าหมายนี้แล้วตั้งใหม่)", inline=False)
+
 
     view = StockView(uid, stock, user_targets[uid][stock])
     await interaction.response.send_message(embed=embed, view=view)
