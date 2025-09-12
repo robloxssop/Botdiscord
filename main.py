@@ -10,7 +10,8 @@ import statistics
 import concurrent.futures
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Set logging level to WARNING to hide INFO messages, and only show warnings and errors.
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("stockbot")
 
 # --- Environment Variables ---
@@ -19,8 +20,6 @@ GUILD_ID = os.environ.get("GUILD_ID")
 DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 
 # --- Global Data Storage (Consider a database for persistence) ---
-# Store trigger_type along with target price
-# {user_id: {symbol: {'target': float, 'trigger_type': 'below' | 'above'}}}
 user_targets = {}
 user_messages = {}
 user_dm_preference = {}
@@ -205,7 +204,8 @@ class StockBot(commands.Bot):
 
     @tasks.loop(minutes=5)
     async def auto_check(self):
-        logger.info("เริ่มการตรวจสอบราคาหุ้นอัตโนมัติ...")
+        # This will not print to the console because the logging level is set to WARNING
+        # logger.info("เริ่มการตรวจสอบราคาหุ้นอัตโนมัติ...") 
         for uid, targets in list(user_targets.items()):
             for stock, data in list(targets.items()):
                 target = data.get('target')
@@ -265,7 +265,8 @@ class StockBot(commands.Bot):
                         
                         if sent_message:
                             user_messages[(uid, stock)] = sent_message
-                            logger.info(f"ส่งแจ้งเตือนสำหรับ {stock} ถึง {user.name} แล้ว")
+                            # This will not print to the console
+                            # logger.info(f"ส่งแจ้งเตือนสำหรับ {stock} ถึง {user.name} แล้ว")
 
                     except Exception as e:
                         logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
