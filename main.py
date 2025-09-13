@@ -109,12 +109,14 @@ def calculate_technical_levels(symbol: str):
 # --- Custom Views and Modals ---
 
 class StockView(ui.View):
-    def __init__(self, user_id: int, symbol: str, target_data: dict):
+    def __init__(self, user_id: int, symbol: str, target_data: dict, is_approaching: bool = False):
         super().__init__(timeout=None)
         self.user_id = user_id
         self.symbol = symbol
         self.target = target_data.get('target')
         self.trigger_type = target_data.get('trigger_type', 'below')
+        self.is_approaching = is_approaching
+        self.notification_method = target_data.get('notification_method', 'dm')
 
     async def interaction_check(self, interaction: Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -158,6 +160,16 @@ class StockView(ui.View):
     @ui.button(label="❌ ลบเป้าหมาย", style=discord.ButtonStyle.danger)
     async def delete_target(self, interaction: Interaction, button: ui.Button):
         if self.user_id in user_targets and self.symbol in user_targets[self.user_id]:
+            if (self.user_id, self.symbol) in user_messages:
+                try:
+                    old_msg = user_messages[(self.user_id, self.symbol)]
+                    await old_msg.delete()
+                    del user_messages[(self.user_id, self.symbol)]
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    logger.error(f"Error deleting old message for {self.symbol}: {e}")
+
             del user_targets[self.user_id][self.symbol]
             await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{self.symbol}** เรียบร้อยแล้ว", ephemeral=True)
         else:
@@ -204,10 +216,17 @@ class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมาย�
         if trigger not in ['below', 'above']:
             await interaction.response.send_message("❌ ประเภทการแจ้งเตือนไม่ถูกต้อง กรุณาใช้ 'below' หรือ 'above'", ephemeral=True)
             return
-
+            
         if self.user_id not in user_targets:
             user_targets[self.user_id] = {}
-        user_targets[self.user_id][self.symbol] = {'target': value, 'trigger_type': trigger}
+        
+        user_targets[self.user_id][self.symbol] = {
+            'target': value, 
+            'trigger_type': trigger,
+            'alert_threshold_percent': user_targets[self.user_id].get(self.symbol, {}).get('alert_threshold_percent', 5.0),
+            'approaching_alert_sent': False,
+            'notification_method': user_targets[self.user_id].get(self.symbol, {}).get('notification_method', 'dm')
+        }
         
         await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา {trigger}) เรียบร้อยแล้ว", ephemeral=True)
 
@@ -240,11 +259,66 @@ class StockBot(commands.Bot):
             for stock, data in list(targets.items()):
                 target = data.get('target')
                 trigger_type = data.get('trigger_type', 'below')
+                alert_threshold_percent = data.get('alert_threshold_percent', 5.0)
+                approaching_alert_sent = data.get('approaching_alert_sent', False)
+                notification_method = data.get('notification_method', 'dm')
                 
                 price = await async_fetch_price(stock)
                 if price is None:
                     continue
                 
+                # --- Check for approaching target ---
+                should_notify_approaching = False
+                if not approaching_alert_sent:
+                    if trigger_type == 'below':
+                        if target < price <= target * (1 + alert_threshold_percent / 100):
+                            should_notify_approaching = True
+                    elif trigger_type == 'above':
+                        if target > price >= target * (1 - alert_threshold_percent / 100):
+                            should_notify_approaching = True
+
+                if should_notify_approaching:
+                    try:
+                        user = await self.fetch_user(uid)
+                        if user is None: continue
+                        
+                        levels = await async_fetch_technical_levels(stock)
+                        
+                        embed = discord.Embed(
+                            title="🔔 ราคาหุ้นใกล้ถึงเป้าหมายแล้ว!",
+                            description=f"หุ้น **{stock}** กำลังเคลื่อนเข้าใกล้ราคาเป้าหมายของคุณ",
+                            color=0xf39c12,
+                            timestamp=datetime.datetime.now(datetime.timezone.utc)
+                        )
+                        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+                        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+                        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับ' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับ'}", inline=False)
+                        
+                        if levels:
+                            embed.add_field(name="แนวรับ", value=f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท", inline=True)
+                            embed.add_field(name="แนวต้าน", value=f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท", inline=True)
+                        
+                        view = StockView(uid, stock, data, is_approaching=True)
+                        
+                        sent_message = None
+                        if notification_method == 'dm':
+                            sent_message = await user.send(embed=embed, view=view)
+                        else:
+                            channel = self.get_channel(DEFAULT_CHANNEL_ID)
+                            if channel:
+                                sent_message = await channel.send(f"แจ้งเตือนสำหรับ {user.mention}", embed=embed, view=view)
+                            else:
+                                logger.warning(f"ไม่พบ channel ID: {DEFAULT_CHANNEL_ID}")
+                                continue
+
+                        if sent_message:
+                            user_targets[uid][stock]['approaching_alert_sent'] = True
+                            user_messages[(uid, stock)] = sent_message
+
+                    except Exception as e:
+                        logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนราคาใกล้เป้าสำหรับ {stock} ถึง {uid}: {e}")
+
+                # --- Check for target reached ---
                 should_notify = False
                 if trigger_type == 'below' and price <= target:
                     should_notify = True
@@ -254,16 +328,7 @@ class StockBot(commands.Bot):
                 if should_notify:
                     try:
                         user = await self.fetch_user(uid)
-                        if user is None:
-                            continue
-                        
-                        old_msg = user_messages.get((uid, stock))
-                        if old_msg:
-                            try:
-                                await old_msg.delete()
-                            except (discord.NotFound, discord.Forbidden):
-                                logger.info(f"ไม่สามารถลบข้อความเก่าได้ (อาจถูกลบไปแล้ว): {uid}, {stock}")
-                                pass
+                        if user is None: continue
                         
                         levels = await async_fetch_technical_levels(stock)
                         
@@ -283,10 +348,9 @@ class StockBot(commands.Bot):
                             embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
                         
                         view = StockView(uid, stock, data)
-                        method = user_dm_preference.get(uid, "dm")
                         
                         sent_message = None
-                        if method == "dm":
+                        if notification_method == 'dm':
                             sent_message = await user.send(embed=embed, view=view)
                         else:
                             channel = self.get_channel(DEFAULT_CHANNEL_ID)
@@ -297,7 +361,11 @@ class StockBot(commands.Bot):
                                 continue
                         
                         if sent_message:
-                            user_messages[(uid, stock)] = sent_message
+                            if uid in user_targets and stock in user_targets[uid]:
+                                del user_targets[uid][stock]
+                            
+                            if (uid, stock) in user_messages:
+                                del user_messages[(uid, stock)]
 
                     except Exception as e:
                         logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
@@ -306,15 +374,31 @@ class StockBot(commands.Bot):
 stock_group = app_commands.Group(name="stock", description="คำสั่งสำหรับจัดการข้อมูลหุ้น")
 
 @stock_group.command(name="set", description="ตั้งเป้าหมายราคาหุ้น")
-@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK", target="ราคาเป้าหมาย", trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)")
-@app_commands.choices(trigger_type=[
-    app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
-    app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
-])
-async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below'):
+@app_commands.describe(
+    stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
+    target="ราคาเป้าหมาย",
+    trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)",
+    alert_threshold_percent="เปอร์เซ็นต์ที่ต้องการให้แจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (ค่าเริ่มต้น 5%)",
+    notification_method="ช่องทางการแจ้งเตือน ('dm' หรือ 'channel', ค่าเริ่มต้นคือ dm)"
+)
+@app_commands.choices(
+    trigger_type=[
+        app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
+        app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
+    ],
+    notification_method=[
+        app_commands.Choice(name="ข้อความส่วนตัว (DM)", value="dm"),
+        app_commands.Choice(name="แชทรวม (Public Channel)", value="channel")
+    ]
+)
+async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below', alert_threshold_percent: float = 5.0, notification_method: str = 'dm'):
     uid = interaction.user.id
     stock = stock.upper()
     
+    if alert_threshold_percent < 0 or alert_threshold_percent > 100:
+        await interaction.response.send_message("❌ เปอร์เซ็นต์การแจ้งเตือนต้องอยู่ระหว่าง 0 ถึง 100", ephemeral=True)
+        return
+        
     price = await async_fetch_price(stock)
     if price is None:
         await interaction.response.send_message(f"❌ ไม่พบหุ้นชื่อ **{stock}** หรือข้อมูลไม่ถูกต้อง กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
@@ -322,10 +406,14 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
 
     if uid not in user_targets:
         user_targets[uid] = {}
-        # Set default DM preference for new users
-        user_dm_preference[uid] = "dm"
 
-    user_targets[uid][stock] = {'target': target, 'trigger_type': trigger_type}
+    user_targets[uid][stock] = {
+        'target': target, 
+        'trigger_type': trigger_type,
+        'alert_threshold_percent': alert_threshold_percent,
+        'approaching_alert_sent': False,
+        'notification_method': notification_method
+    }
     
     embed = discord.Embed(
         title="✅ ตั้งเป้าหมายสำเร็จ",
@@ -335,8 +423,8 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
     )
     embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
     embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
-    embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**ข้อความส่วนตัว (DM)**\n(หากต้องการเปลี่ยน ต้องลบเป้าหมายนี้แล้วตั้งใหม่)", inline=False)
-
+    embed.add_field(name="แจ้งเตือนใกล้เป้าหมาย", value=f"**{alert_threshold_percent}%**", inline=False)
+    embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**{'ข้อความส่วนตัว (DM)' if notification_method == 'dm' else 'แชทรวม' }**", inline=False)
 
     view = StockView(uid, stock, user_targets[uid][stock])
     await interaction.response.send_message(embed=embed, view=view)
@@ -400,7 +488,8 @@ async def show_targets_cmd(interaction: Interaction):
     )
     for s, data in targets.items():
         trigger_text = 'ต่ำกว่าหรือเท่ากับ' if data['trigger_type'] == 'below' else 'สูงกว่าหรือเท่ากับ'
-        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nแจ้งเตือนเมื่อราคา {trigger_text} เป้าหมาย", inline=False)
+        notification_text = 'ข้อความส่วนตัว (DM)' if data.get('notification_method', 'dm') == 'dm' else 'แชทรวม'
+        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nแจ้งเตือนเมื่อราคา {trigger_text} เป้าหมาย\nแจ้งเตือนใกล้เป้า: **{data['alert_threshold_percent']}%**\nช่องทาง: **{notification_text}**", inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -411,6 +500,16 @@ async def delete_target_cmd(interaction: Interaction, stock: str):
     stock = stock.upper()
     
     if uid in user_targets and stock in user_targets[uid]:
+        if (uid, stock) in user_messages:
+            try:
+                old_msg = user_messages[(uid, stock)]
+                await old_msg.delete()
+                del user_messages[(uid, stock)]
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                logger.error(f"เกิดข้อผิดพลาดในการลบข้อความแจ้งเตือนเก่าสำหรับ {stock}: {e}")
+        
         del user_targets[uid][stock]
         await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{stock}** เรียบร้อยแล้ว", ephemeral=True)
     else:
