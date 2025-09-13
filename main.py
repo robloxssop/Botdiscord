@@ -143,8 +143,8 @@ class StockView(ui.View):
         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if self.trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
         
         if levels:
-            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
-            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            support_levels = f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**แนวรับค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**แนวต้านค่าเฉลี่ย:** {levels['std_r']} บาท"
             embed.add_field(name="แนวรับ", value=support_levels, inline=False)
             embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
         
@@ -187,16 +187,16 @@ class StockView(ui.View):
             color=0x1abc9c,
             timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
-        support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
-        resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
-        embed.add_field(name="แนวรับ", value=support_levels, inline=False)
-        embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        support_levels = f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**แนวรับค่าเฉลี่ย:** {levels['std_s']} บาท"
+        resistance_levels = f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**แนวต้านค่าเฉลี่ย:** {levels['std_r']} บาท"
+        embed.add_field(name="แนวรับ 📉", value=support_levels, inline=False)
+        embed.add_field(name="แนวต้าน 📈", value=resistance_levels, inline=False)
         
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมายหุ้น"):
     new_target = ui.TextInput(label="ราคาเป้าหมายใหม่", style=discord.TextStyle.short, placeholder="กรุณาใส่ราคาเป้าหมายเป็นตัวเลข")
-    new_trigger_type = ui.TextInput(label="ประเภทการแจ้งเตือน (below/above)", style=discord.TextStyle.short, default="below")
+    new_trigger_type = ui.TextInput(label="เงื่อนไข (ราคาต่ำกว่า/ราคาสูงกว่า)", style=discord.TextStyle.short, default="ต่ำกว่า")
     
     def __init__(self, user_id: int, symbol: str):
         super().__init__()
@@ -210,9 +210,10 @@ class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมาย�
             await interaction.response.send_message("❌ กรุณากรอกราคาเป็นตัวเลขที่ถูกต้อง", ephemeral=True)
             return
         
-        trigger = self.new_trigger_type.value.lower()
-        if trigger not in ['below', 'above']:
-            await interaction.response.send_message("❌ ประเภทการแจ้งเตือนไม่ถูกต้อง กรุณาใช้ 'below' หรือ 'above'", ephemeral=True)
+        trigger_map = {'ต่ำกว่า': 'below', 'ราคาสูงกว่า': 'above'}
+        trigger = trigger_map.get(self.new_trigger_type.value.lower().replace('ราคา', ''), None)
+        if not trigger:
+            await interaction.response.send_message("❌ เงื่อนไขไม่ถูกต้อง กรุณาใช้ 'ราคาต่ำกว่า' หรือ 'ราคาสูงกว่า'", ephemeral=True)
             return
             
         if self.user_id not in user_targets:
@@ -225,7 +226,7 @@ class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมาย�
             'approaching_alert_sent': False
         }
         
-        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา {trigger}) เรียบร้อยแล้ว", ephemeral=True)
+        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา{self.new_trigger_type.value}) เรียบร้อยแล้ว", ephemeral=True)
 
 # --- Bot Class and Commands ---
 class StockBot(commands.Bot):
@@ -291,8 +292,8 @@ class StockBot(commands.Bot):
                         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับ' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับ'}", inline=False)
                         
                         if levels:
-                            embed.add_field(name="แนวรับ", value=f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท", inline=True)
-                            embed.add_field(name="แนวต้าน", value=f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท", inline=True)
+                            embed.add_field(name="แนวรับ", value=f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท", inline=True)
+                            embed.add_field(name="แนวต้าน", value=f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท", inline=True)
                         
                         view = StockView(uid, stock, data, is_approaching=True)
                         
@@ -329,8 +330,8 @@ class StockBot(commands.Bot):
                         embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
                         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
                         if levels:
-                            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
-                            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+                            support_levels = f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**แนวรับค่าเฉลี่ย:** {levels['std_s']} บาท"
+                            resistance_levels = f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**แนวต้านค่าเฉลี่ย:** {levels['std_r']} บาท"
                             embed.add_field(name="แนวรับ", value=support_levels, inline=False)
                             embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
                         
@@ -353,22 +354,22 @@ stock_group = app_commands.Group(name="หุ้น", description="คำสั�
 
 @stock_group.command(name="ตั้ง", description="ตั้งเป้าหมายราคาหุ้น")
 @app_commands.describe(
-    stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
-    target="ราคาเป้าหมาย",
-    trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)",
-    alert_threshold_percent="เปอร์เซ็นต์ที่ต้องการให้แจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (ค่าเริ่มต้น 5%)"
+    หุ้น="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
+    ราคาเป้าหมาย="ราคาที่ต้องการให้บอทแจ้งเตือน",
+    เงื่อนไข="เลือกว่าจะให้แจ้งเตือนเมื่อราคาต่ำกว่าหรือสูงกว่าเป้าหมาย (ค่าเริ่มต้น: ต่ำกว่า)",
+    แจ้งเตือนล่วงหน้า="เปอร์เซ็นต์ที่ต้องการให้บอทแจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (เช่น 5 หมายถึง 5%)"
 )
 @app_commands.choices(
-    trigger_type=[
-        app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
-        app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
+    เงื่อนไข=[
+        app_commands.Choice(name="ราคาต่ำกว่า", value="below"),
+        app_commands.Choice(name="ราคาสูงกว่า", value="above")
     ]
 )
-async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below', alert_threshold_percent: float = 5.0):
+async def set_target_cmd(interaction: Interaction, หุ้น: str, ราคาเป้าหมาย: float, เงื่อนไข: str = 'below', แจ้งเตือนล่วงหน้า: float = 5.0):
     uid = interaction.user.id
-    stock = stock.upper()
+    stock = หุ้น.upper()
     
-    if alert_threshold_percent < 0 or alert_threshold_percent > 100:
+    if แจ้งเตือนล่วงหน้า < 0 or แจ้งเตือนล่วงหน้า > 100:
         await interaction.response.send_message("❌ เปอร์เซ็นต์การแจ้งเตือนต้องอยู่ระหว่าง 0 ถึง 100", ephemeral=True)
         return
         
@@ -381,11 +382,13 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
         user_targets[uid] = {}
 
     user_targets[uid][stock] = {
-        'target': target, 
-        'trigger_type': trigger_type,
-        'alert_threshold_percent': alert_threshold_percent,
+        'target': ราคาเป้าหมาย, 
+        'trigger_type': เงื่อนไข,
+        'alert_threshold_percent': แจ้งเตือนล่วงหน้า,
         'approaching_alert_sent': False
     }
+    
+    trigger_text_map = {'below': 'ราคาต่ำกว่าหรือเท่ากับเป้าหมาย', 'above': 'ราคาสูงกว่าหรือเท่ากับเป้าหมาย'}
     
     embed = discord.Embed(
         title="✅ ตั้งเป้าหมายสำเร็จ",
@@ -393,19 +396,19 @@ async def set_target_cmd(interaction: Interaction, stock: str, target: float, tr
         color=0x2ecc71,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
-    embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
-    embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
-    embed.add_field(name="แจ้งเตือนใกล้เป้าหมาย", value=f"**{alert_threshold_percent}%**", inline=False)
+    embed.add_field(name="ราคาเป้าหมาย", value=f"**{ราคาเป้าหมาย}** บาท", inline=True)
+    embed.add_field(name="เงื่อนไข", value=trigger_text_map[เงื่อนไข], inline=True)
+    embed.add_field(name="แจ้งเตือนล่วงหน้า", value=f"**{แจ้งเตือนล่วงหน้า}%**", inline=False)
     embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**ข้อความส่วนตัว (DM)**", inline=False)
 
     view = StockView(uid, stock, user_targets[uid][stock])
     await interaction.response.send_message(embed=embed, view=view)
 
 @stock_group.command(name="ราคา", description="เช็คราคาหุ้นปัจจุบัน")
-@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
-async def check_stock_cmd(interaction: Interaction, stock: str):
+@app_commands.describe(หุ้น="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
+async def check_stock_cmd(interaction: Interaction, หุ้น: str):
     await interaction.response.defer(ephemeral=True)
-    stock = stock.upper()
+    stock = หุ้น.upper()
     price = await async_fetch_price(stock)
     
     if price is None:
@@ -433,8 +436,8 @@ async def check_stock_cmd(interaction: Interaction, stock: str):
         embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
         
         if levels:
-            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
-            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            support_levels = f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**แนวรับค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**แนวต้านค่าเฉลี่ย:** {levels['std_r']} บาท"
             embed.add_field(name="แนวรับ", value=support_levels, inline=False)
             embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
         embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
@@ -460,15 +463,15 @@ async def show_targets_cmd(interaction: Interaction):
     )
     for s, data in targets.items():
         trigger_text = 'ต่ำกว่าหรือเท่ากับ' if data['trigger_type'] == 'below' else 'สูงกว่าหรือเท่ากับ'
-        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nแจ้งเตือนเมื่อราคา {trigger_text} เป้าหมาย\nแจ้งเตือนใกล้เป้า: **{data['alert_threshold_percent']}%**\nช่องทาง: **ข้อความส่วนตัว (DM)**", inline=False)
+        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nเงื่อนไข: **{trigger_text}** เป้าหมาย\nแจ้งเตือนล่วงหน้า: **{data['alert_threshold_percent']}%**\nช่องทาง: **ข้อความส่วนตัว (DM)**", inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @stock_group.command(name="ลบ", description="ลบเป้าหมายหุ้น")
-@app_commands.describe(stock="ชื่อหุ้นที่จะลบ")
-async def delete_target_cmd(interaction: Interaction, stock: str):
+@app_commands.describe(หุ้น="ชื่อหุ้นที่จะลบ")
+async def delete_target_cmd(interaction: Interaction, หุ้น: str):
     uid = interaction.user.id
-    stock = stock.upper()
+    stock = หุ้น.upper()
     
     if uid in user_targets and stock in user_targets[uid]:
         if (uid, stock) in user_messages:
@@ -487,10 +490,10 @@ async def delete_target_cmd(interaction: Interaction, stock: str):
         await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้สำหรับหุ้นนี้", ephemeral=True)
 
 @stock_group.command(name="แนวรับแนวต้าน", description="ดูแนวรับและแนวต้านของหุ้น (หลายมุมมอง)")
-@app_commands.describe(stock="ชื่อหุ้นที่จะดูข้อมูล")
-async def levels_cmd(interaction: Interaction, stock: str):
+@app_commands.describe(หุ้น="ชื่อหุ้นที่จะดูข้อมูล")
+async def levels_cmd(interaction: Interaction, หุ้น: str):
     await interaction.response.defer(ephemeral=True)
-    stock = stock.upper()
+    stock = หุ้น.upper()
     levels = await async_fetch_technical_levels(stock)
     
     if levels is None:
@@ -503,8 +506,8 @@ async def levels_cmd(interaction: Interaction, stock: str):
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
     
-    support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
-    resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+    support_levels = f"**แนวรับ Pivot:** {levels['pivot_s1']} บาท\n**แนวรับ Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**แนวรับค่าเฉลี่ย:** {levels['std_s']} บาท"
+    resistance_levels = f"**แนวต้าน Pivot:** {levels['pivot_r1']} บาท\n**แนวต้าน Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**แนวต้านค่าเฉลี่ย:** {levels['std_r']} บาท"
     
     embed.add_field(name="แนวรับ 📉", value=support_levels, inline=False)
     embed.add_field(name="แนวต้าน 📈", value=resistance_levels, inline=False)
@@ -520,4 +523,3 @@ if __name__ == "__main__":
         bot = StockBot()
         bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
-
