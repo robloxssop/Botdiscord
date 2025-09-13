@@ -16,6 +16,7 @@ logger = logging.getLogger("stockbot")
 # --- Environment Variables ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
+DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 
 # --- Global Data Storage (Consider a database for persistence) ---
 user_targets = {}
@@ -105,6 +106,7 @@ def calculate_technical_levels(symbol: str):
         return None
 
 # --- Custom Views and Modals ---
+
 class StockView(ui.View):
     def __init__(self, user_id: int, symbol: str, target_data: dict, is_approaching: bool = False):
         super().__init__(timeout=None)
@@ -293,15 +295,15 @@ class StockBot(commands.Bot):
                             embed.add_field(name="แนวต้าน", value=f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท", inline=True)
                         
                         view = StockView(uid, stock, data, is_approaching=True)
-                        sent_message = await user.send(embed=embed, view=view)
                         
-                        user_targets[uid][stock]['approaching_alert_sent'] = True
-                        user_messages[(uid, stock)] = sent_message
+                        sent_message = await user.send(embed=embed, view=view)
+
+                        if sent_message:
+                            user_targets[uid][stock]['approaching_alert_sent'] = True
+                            user_messages[(uid, stock)] = sent_message
 
                     except Exception as e:
                         logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนราคาใกล้เป้าสำหรับ {stock} ถึง {uid}: {e}")
-                        # If a DM fails, we can't send a message. Let's just log and move on.
-                        # It's important not to remove the target, as the user might fix their DM settings later.
 
                 # --- Check for target reached ---
                 should_notify = False
@@ -333,39 +335,40 @@ class StockBot(commands.Bot):
                             embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
                         
                         view = StockView(uid, stock, data)
+                        
                         sent_message = await user.send(embed=embed, view=view)
                         
-                        # Remove target and message from storage
-                        if uid in user_targets and stock in user_targets[uid]:
-                            del user_targets[uid][stock]
-                        
-                        if (uid, stock) in user_messages:
-                            del user_messages[(uid, stock)]
+                        if sent_message:
+                            if uid in user_targets and stock in user_targets[uid]:
+                                del user_targets[uid][stock]
+                            
+                            if (uid, stock) in user_messages:
+                                del user_messages[(uid, stock)]
 
                     except Exception as e:
                         logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
 
-# --- Slash Command Group (Thai) ---
+# --- Slash Command Group ---
 stock_group = app_commands.Group(name="หุ้น", description="คำสั่งสำหรับจัดการข้อมูลหุ้น")
 
-@stock_group.command(name="ตั้งราคา", description="ตั้งเป้าหมายราคาหุ้น")
+@stock_group.command(name="ตั้ง", description="ตั้งเป้าหมายราคาหุ้น")
 @app_commands.describe(
-    ชื่อหุ้น="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
-    ราคาเป้าหมาย="ราคาเป้าหมาย",
-    ประเภทการแจ้งเตือน="ประเภทการแจ้งเตือน ('ต่ำกว่า' หรือ 'สูงกว่า', ค่าเริ่มต้นคือ ต่ำกว่า)",
-    เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย="เปอร์เซ็นต์ที่ต้องการให้แจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (ค่าเริ่มต้น 5%)"
+    stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
+    target="ราคาเป้าหมาย",
+    trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)",
+    alert_threshold_percent="เปอร์เซ็นต์ที่ต้องการให้แจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (ค่าเริ่มต้น 5%)"
 )
 @app_commands.choices(
-    ประเภทการแจ้งเตือน=[
+    trigger_type=[
         app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
         app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
     ]
 )
-async def set_target_cmd(interaction: Interaction, ชื่อหุ้น: str, ราคาเป้าหมาย: float, ประเภทการแจ้งเตือน: str = 'below', เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย: float = 5.0):
+async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below', alert_threshold_percent: float = 5.0):
     uid = interaction.user.id
-    stock = ชื่อหุ้น.upper()
+    stock = stock.upper()
     
-    if เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย < 0 or เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย > 100:
+    if alert_threshold_percent < 0 or alert_threshold_percent > 100:
         await interaction.response.send_message("❌ เปอร์เซ็นต์การแจ้งเตือนต้องอยู่ระหว่าง 0 ถึง 100", ephemeral=True)
         return
         
@@ -378,9 +381,9 @@ async def set_target_cmd(interaction: Interaction, ชื่อหุ้น: str
         user_targets[uid] = {}
 
     user_targets[uid][stock] = {
-        'target': ราคาเป้าหมาย, 
-        'trigger_type': ประเภทการแจ้งเตือน,
-        'alert_threshold_percent': เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย,
+        'target': target, 
+        'trigger_type': trigger_type,
+        'alert_threshold_percent': alert_threshold_percent,
         'approaching_alert_sent': False
     }
     
@@ -390,19 +393,19 @@ async def set_target_cmd(interaction: Interaction, ชื่อหุ้น: str
         color=0x2ecc71,
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
-    embed.add_field(name="ราคาเป้าหมาย", value=f"**{ราคาเป้าหมาย}** บาท", inline=True)
-    embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if ประเภทการแจ้งเตือน == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
-    embed.add_field(name="แจ้งเตือนใกล้เป้าหมาย", value=f"**{เปอร์เซ็นต์แจ้งเตือนเมื่อเข้าใกล้เป้าหมาย}%**", inline=False)
-    embed.add_field(name="ช่องทางแจ้งเตือน", value="**ข้อความส่วนตัว (DM)**", inline=False)
+    embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+    embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
+    embed.add_field(name="แจ้งเตือนใกล้เป้าหมาย", value=f"**{alert_threshold_percent}%**", inline=False)
+    embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**ข้อความส่วนตัว (DM)**", inline=False)
 
     view = StockView(uid, stock, user_targets[uid][stock])
     await interaction.response.send_message(embed=embed, view=view)
 
-@stock_group.command(name="เช็คราคา", description="เช็คราคาหุ้นปัจจุบัน")
-@app_commands.describe(ชื่อหุ้น="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
-async def check_stock_cmd(interaction: Interaction, ชื่อหุ้น: str):
+@stock_group.command(name="ราคา", description="เช็คราคาหุ้นปัจจุบัน")
+@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
+async def check_stock_cmd(interaction: Interaction, stock: str):
     await interaction.response.defer(ephemeral=True)
-    stock = ชื่อหุ้น.upper()
+    stock = stock.upper()
     price = await async_fetch_price(stock)
     
     if price is None:
@@ -461,11 +464,11 @@ async def show_targets_cmd(interaction: Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@stock_group.command(name="ลบหุ้น", description="ลบเป้าหมายหุ้น")
-@app_commands.describe(ชื่อหุ้น="ชื่อหุ้นที่จะลบ")
-async def delete_target_cmd(interaction: Interaction, ชื่อหุ้น: str):
+@stock_group.command(name="ลบ", description="ลบเป้าหมายหุ้น")
+@app_commands.describe(stock="ชื่อหุ้นที่จะลบ")
+async def delete_target_cmd(interaction: Interaction, stock: str):
     uid = interaction.user.id
-    stock = ชื่อหุ้น.upper()
+    stock = stock.upper()
     
     if uid in user_targets and stock in user_targets[uid]:
         if (uid, stock) in user_messages:
@@ -484,10 +487,10 @@ async def delete_target_cmd(interaction: Interaction, ชื่อหุ้น: 
         await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้สำหรับหุ้นนี้", ephemeral=True)
 
 @stock_group.command(name="แนวรับแนวต้าน", description="ดูแนวรับและแนวต้านของหุ้น (หลายมุมมอง)")
-@app_commands.describe(ชื่อหุ้น="ชื่อหุ้นที่จะดูข้อมูล")
-async def levels_cmd(interaction: Interaction, ชื่อหุ้น: str):
+@app_commands.describe(stock="ชื่อหุ้นที่จะดูข้อมูล")
+async def levels_cmd(interaction: Interaction, stock: str):
     await interaction.response.defer(ephemeral=True)
-    stock = ชื่อหุ้น.upper()
+    stock = stock.upper()
     levels = await async_fetch_technical_levels(stock)
     
     if levels is None:
@@ -517,3 +520,4 @@ if __name__ == "__main__":
         bot = StockBot()
         bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
+
