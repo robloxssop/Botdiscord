@@ -8,6 +8,7 @@ from discord import app_commands, ui, Interaction, embeds
 import yfinance as yf
 import statistics
 import concurrent.futures
+import requests
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -17,6 +18,7 @@ logger = logging.getLogger("stockbot")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
 DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 # --- Global Data Storage (Consider a database for persistence) ---
 user_targets = {}
@@ -103,6 +105,42 @@ def calculate_technical_levels(symbol: str):
         }
     except Exception as e:
         logger.warning(f"ไม่สามารถคำนวณแนวรับแนวต้าน {symbol}: {e}")
+        return None
+
+async def async_fetch_news(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, fetch_news_blocking, symbol)
+    except Exception as e:
+        logger.error(f"Error fetching news for {symbol}: {e}")
+        return None
+
+def fetch_news_blocking(symbol: str):
+    """Blocking function to fetch a stock's latest news."""
+    if not FINNHUB_API_KEY:
+        logger.error("FINNHUB_API_KEY is not set.")
+        return None
+    
+    # ดึงข่าวสารล่าสุดในช่วง 1 สัปดาห์ที่ผ่านมา
+    to_date = datetime.date.today()
+    from_date = to_date - datetime.timedelta(days=7)
+    
+    url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as err:
+        if err.response.status_code == 429:
+            logger.warning("Finnhub API rate limit exceeded.")
+        elif err.response.status_code == 401:
+            logger.error("Invalid Finnhub API key.")
+        else:
+            logger.error(f"HTTP Error for news fetching: {err}")
+        return None
+    except Exception as e:
+        logger.error(f"An error occurred while fetching news for {symbol}: {e}")
         return None
 
 # --- Custom Views and Modals ---
@@ -513,6 +551,46 @@ async def levels_cmd(interaction: Interaction, หุ้น: str):
     embed.add_field(name="แนวต้าน 📈", value=resistance_levels, inline=False)
     
     embed.set_footer(text="คำนวณจากข้อมูลย้อนหลัง 3 เดือน")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@stock_group.command(name="ข่าว", description="ดูข่าวล่าสุดของหุ้น")
+@app_commands.describe(หุ้น="ชื่อหุ้นที่ต้องการดูข่าว")
+async def news_cmd(interaction: Interaction, หุ้น: str):
+    await interaction.response.defer(ephemeral=True)
+    stock = หุ้น.upper()
+    
+    if not FINNHUB_API_KEY:
+        await interaction.followup.send("❌ บอทยังไม่ได้ตั้งค่า Finnhub API Key กรุณาแจ้งผู้ดูแล", ephemeral=True)
+        return
+
+    news_data = await async_fetch_news(stock)
+    
+    if news_data is None:
+        await interaction.followup.send(f"❌ ไม่สามารถดึงข่าวของหุ้น **{stock}** ได้ อาจเป็นเพราะชื่อหุ้นไม่ถูกต้องหรือโควต้า API หมด", ephemeral=True)
+        return
+    
+    if not news_data:
+        await interaction.followup.send(f"⚠️ ไม่พบข่าวล่าสุดสำหรับหุ้น **{stock}** ในช่วงสัปดาห์ที่ผ่านมา", ephemeral=True)
+        return
+
+    # สร้าง Embed สำหรับแสดงข่าว
+    embed = discord.Embed(
+        title=f"📰 ข่าวล่าสุดสำหรับ {stock}",
+        description="นี่คือข่าวที่เกี่ยวข้องกับหุ้นนี้ในรอบ 7 วันที่ผ่านมา:",
+        color=0x1abc9c,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    
+    # แสดงข่าว 5 อันดับแรก
+    for article in news_data[:5]:
+        embed.add_field(
+            name=f"[{article.get('headline')}]({article.get('url')})",
+            value=f"_{article.get('source')}_ - {article.get('summary')}\n",
+            inline=False
+        )
+        
+    embed.set_footer(text="ข้อมูลจาก Finnhub")
     
     await interaction.followup.send(embed=embed, ephemeral=True)
 
