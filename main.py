@@ -1,318 +1,40 @@
 import os
-import yfinance as yf
-import requests
-import time
+import asyncio
 import logging
-import json
-import threading
-from flask import Flask, redirect, url_for, render_template_string, request, session, jsonify
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+import datetime
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+from discord import app_commands, ui, Interaction, embeds
+import yfinance as yf
+import statistics
+import concurrent.futures
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("stock_alert_bot")
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("stockbot")
 
-# --- Environment Variables (Secrets) ---
-DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+# --- Environment Variables ---
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GUILD_ID = os.environ.get("GUILD_ID")
+DEFAULT_CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 
-if not all([DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI, DISCORD_BOT_TOKEN]):
-    logger.error("❌ กรุณาตั้งค่า DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI และ DISCORD_BOT_TOKEN ใน Environment Variables ให้ครบถ้วน")
+# --- Global Data Storage (Consider a database for persistence) ---
+user_targets = {}
+user_messages = {}
 
-# --- Flask App Setup ---
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)
+# --- Asynchronous Wrappers for Blocking I/O ---
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
-login_manager = LoginManager()
-login_manager.init_app(app)
-
-# --- Database & User Management ---
-class User(UserMixin):
-    def __init__(self, user_id, username):
-        self.id = user_id
-        self.username = username
-        self.targets = {}
-
-    def get_id(self):
-        return self.id
-
-class Database:
-    def __init__(self, file_path='discord_users.json'):
-        self.file_path = file_path
-        self.data = self.load_data()
-
-    def load_data(self):
-        try:
-            with open(self.file_path, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def save_data(self):
-        with open(self.file_path, 'w') as f:
-            json.dump(self.data, f, indent=4)
-
-    def get_user(self, user_id):
-        user_data = self.data.get(str(user_id))
-        if user_data:
-            user = User(user_data['id'], user_data['username'])
-            user.targets = user_data['targets']
-            return user
+async def async_fetch_price(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, fetch_price_blocking, symbol)
+    except Exception as e:
+        logger.error(f"Error fetching price for {symbol}: {e}")
         return None
 
-    def add_user(self, user):
-        self.data[str(user.id)] = {'id': user.id, 'username': user.username, 'targets': {}}
-        self.save_data()
-
-    def update_user_targets(self, user_id, targets):
-        if str(user_id) in self.data:
-            self.data[str(user_id)]['targets'] = targets
-            self.save_data()
-
-db = Database()
-
-@login_manager.user_loader
-def load_user(user_id):
-    return db.get_user(user_id)
-
-# --- Discord OAuth2 Logic ---
-DISCORD_API_BASE = 'https://discord.com/api/v10'
-
-@app.route('/login')
-def login_discord():
-    return redirect(f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify")
-
-@app.route('/callback')
-def callback():
-    code = request.args.get('code')
-    if not code:
-        return "Authorization failed.", 400
-
-    token_url = f"{DISCORD_API_BASE}/oauth2/token"
-    data = {
-        'client_id': DISCORD_CLIENT_ID,
-        'client_secret': DISCORD_CLIENT_SECRET,
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': DISCORD_REDIRECT_URI,
-        'scope': 'identify'
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    r = requests.post(token_url, data=data, headers=headers)
-    
-    if r.status_code != 200:
-        logger.error(f"Failed to get token: {r.text}")
-        return "Failed to get access token.", 500
-
-    token_info = r.json()
-    access_token = token_info.get('access_token')
-
-    user_url = f"{DISCORD_API_BASE}/users/@me"
-    user_headers = {'Authorization': f'Bearer {access_token}'}
-    user_r = requests.get(user_url, headers=user_headers)
-
-    if user_r.status_code != 200:
-        logger.error(f"Failed to get user info: {user_r.text}")
-        return "Failed to get user info.", 500
-
-    user_info = user_r.json()
-    user_id = user_info['id']
-    username = user_info['username']
-
-    user = db.get_user(user_id)
-    if not user:
-        user = User(user_id, username)
-        db.add_user(user)
-
-    login_user(user)
-    return redirect(url_for('dashboard'))
-
-# --- Web Application Routes ---
-@app.route('/')
-def index():
-    if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))
-    return render_template_string("""
-        <!doctype html>
-        <html lang="th">
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-            <title>ล็อกอินด้วย Discord</title>
-            <style>
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding-top: 50px; background-color: #f0f2f5; color: #333; }
-                .container { max-width: 450px; margin: auto; padding: 40px; border-radius: 12px; background-color: white; box-shadow: 0 10px 20px rgba(0,0,0,0.05); }
-                h1 { color: #5865F2; margin-bottom: 20px; }
-                .btn { padding: 12px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
-                .btn-discord { background-color: #5865F2; color: white; text-decoration: none; }
-                .btn-discord:hover { background-color: #4B55C4; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>เข้าสู่ระบบด้วย Discord</h1>
-                <a href="/login" class="btn btn-discord">เข้าสู่ระบบด้วย Discord</a>
-            </div>
-        </body>
-        </html>
-    """)
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('index'))
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    targets = db.get_user(current_user.id).targets
-    return render_template_string("""
-        <!doctype html>
-        <html lang="th">
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-            <title>Dashboard</title>
-            <style>
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background-color: #f0f2f5; color: #333; }
-                .container { max-width: 800px; margin: auto; padding: 40px; border-radius: 12px; background-color: white; box-shadow: 0 10px 20px rgba(0,0,0,0.05); }
-                .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-                h2 { color: #5865F2; }
-                .target-form { margin-top: 20px; padding: 30px; border: 1px solid #ddd; border-radius: 12px; background-color: #fafafa; }
-                .form-group { margin-bottom: 15px; }
-                .form-group input, .form-group select { width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
-                .btn { padding: 12px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; transition: background-color 0.3s; }
-                .btn-success { background-color: #28a745; color: white; }
-                .btn-danger { background-color: #dc3545; color: white; }
-                .logout-btn { background-color: #5865F2; color: white; padding: 10px 20px; text-decoration: none; border-radius: 8px; }
-                .target-list { margin-top: 30px; }
-                .target-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; margin-bottom: 10px; border: 1px solid #eee; border-radius: 8px; background-color: #fcfcfc; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h2>สวัสดี, {{ current_user.username }}</h2>
-                    <a href="{{ url_for('logout') }}" class="logout-btn">ออกจากระบบ</a>
-                </div>
-                
-                <div class="target-form">
-                    <h3>ตั้งเป้าหมายหุ้นใหม่</h3>
-                    <form id="set-target-form">
-                        <div class="form-group">
-                            <label for="symbol">ชื่อหุ้น:</label>
-                            <input type="text" id="symbol" name="symbol" placeholder="เช่น AAPL หรือ PTT.BK" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="target_price">ราคาเป้าหมาย:</label>
-                            <input type="number" step="0.01" id="target_price" name="target_price" placeholder="ราคาเป้าหมายเป็นตัวเลข" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="trigger_type">เงื่อนไขการแจ้งเตือน:</label>
-                            <select id="trigger_type" name="trigger_type">
-                                <option value="below">ราคาต่ำกว่า/เท่ากับ</option>
-                                <option value="above">ราคาสูงกว่า/เท่ากับ</option>
-                            </select>
-                        </div>
-                        <button type="submit" class="btn btn-success">ตั้งค่า</button>
-                    </form>
-                </div>
-
-                <div class="target-list">
-                    <h3>รายการเป้าหมายหุ้นของคุณ</h3>
-                    {% if targets %}
-                        {% for symbol, data in targets.items() %}
-                            <div class="target-item">
-                                <div>
-                                    <strong>{{ symbol }}</strong>: เป้าหมายที่ **{{ data.target }}** บาท<br>
-                                    เงื่อนไข: {{ 'ราคาต่ำกว่า/เท่ากับ' if data.trigger_type == 'below' else 'ราคาสูงกว่า/เท่ากับ' }}
-                                </div>
-                                <button class="btn btn-danger" onclick="deleteTarget('{{ symbol }}')">ลบ</button>
-                            </div>
-                        {% endfor %}
-                    {% else %}
-                        <p>คุณยังไม่ได้ตั้งเป้าหมายหุ้นใดๆ</p>
-                    {% endif %}
-                </div>
-            </div>
-            
-            <script>
-                document.getElementById('set-target-form').onsubmit = async (e) => {
-                    e.preventDefault();
-                    const formData = new FormData(e.target);
-                    const data = Object.fromEntries(formData.entries());
-                    const response = await fetch('/api/set_target', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(data)
-                    });
-                    const result = await response.json();
-                    alert(result.message);
-                    if (result.success) { window.location.reload(); }
-                };
-
-                async function deleteTarget(symbol) {
-                    if (!confirm(`คุณต้องการลบเป้าหมายของหุ้น ${symbol} หรือไม่?`)) return;
-                    const response = await fetch('/api/delete_target', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ symbol: symbol })
-                    });
-                    const result = await response.json();
-                    alert(result.message);
-                    if (result.success) { window.location.reload(); }
-                }
-            </script>
-        </body>
-        </html>
-    """, targets=targets)
-
-# --- API Endpoints ---
-@app.route('/api/set_target', methods=['POST'])
-@login_required
-def api_set_target():
-    data = request.json
-    symbol = data.get('symbol', '').upper()
-    target_price = data.get('target_price')
-    trigger_type = data.get('trigger_type', 'below')
-    
-    try:
-        target_price = float(target_price)
-    except (ValueError, TypeError):
-        return jsonify(success=False, message="❌ กรุณากรอกราคาเป็นตัวเลขที่ถูกต้อง"), 400
-
-    user = db.get_user(current_user.id)
-    user.targets[symbol] = {
-        'target': target_price,
-        'trigger_type': trigger_type,
-        'notified': False
-    }
-    db.update_user_targets(current_user.id, user.targets)
-    
-    return jsonify(success=True, message=f"✅ ตั้งเป้าหมายสำหรับ **{symbol}** ที่ **{target_price}** บาทเรียบร้อยแล้ว")
-
-@app.route('/api/delete_target', methods=['POST'])
-@login_required
-def api_delete_target():
-    data = request.json
-    symbol = data.get('symbol', '').upper()
-    user = db.get_user(current_user.id)
-    
-    if symbol in user.targets:
-        del user.targets[symbol]
-        db.update_user_targets(current_user.id, user.targets)
-        return jsonify(success=True, message=f"🗑️ ลบเป้าหมายสำหรับ **{symbol}** เรียบร้อยแล้ว")
-    else:
-        return jsonify(success=False, message="❌ ไม่พบเป้าหมายที่คุณตั้งไว้"), 404
-
-# --- Stock Check and Discord Notify Logic ---
 def fetch_price_blocking(symbol: str):
+    """Blocking function to fetch a stock's current price."""
     try:
         ticker = yf.Ticker(symbol)
         data = ticker.history(period="1d", interval="1m")
@@ -323,65 +45,478 @@ def fetch_price_blocking(symbol: str):
         logger.warning(f"ไม่สามารถดึงราคาหุ้น {symbol}: {e}")
         return None
 
-async def send_discord_notification(user_id: str, message: str):
-    intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+def fetch_historical_data_blocking(symbol: str, period="6mo", interval="1d"):
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period=period, interval=interval)
+        return data
+    except Exception as e:
+        logger.warning(f"ไม่สามารถดึงข้อมูลในอดีตของ {symbol}: {e}")
+        return None
 
-    @bot.event
-    async def on_ready():
-        user = await bot.fetch_user(user_id)
-        if user:
-            await user.send(message)
-            logger.info(f"Notification sent to Discord user {user.name} ({user_id})")
-        await bot.close()
+async def async_fetch_technical_levels(symbol: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(executor, calculate_technical_levels, symbol)
+    except Exception as e:
+        logger.error(f"Error calculating technical levels for {symbol}: {e}")
+        return None
 
-    await bot.start(DISCORD_BOT_TOKEN)
+def calculate_technical_levels(symbol: str):
+    data = fetch_historical_data_blocking(symbol, period="3mo", interval="1d")
+    if data is None or data.empty:
+        return None
 
-def run_stock_checker():
-    while True:
-        logger.info("เริ่มตรวจสอบราคาหุ้น...")
-        all_users_data = db.load_data()
+    try:
+        last_day = data.iloc[-1]
+        p_point = (last_day['High'] + last_day['Low'] + last_day['Close']) / 3
+        s1_pivot = (2 * p_point) - last_day['High']
+        r1_pivot = (2 * p_point) - last_day['Low']
         
-        for user_id_str, user_data in all_users_data.items():
-            user_id = int(user_id_str)
-            targets_to_check = list(user_data.get('targets', {}).items())
+        recent_high = data['High'].iloc[-20:].max()
+        recent_low = data['Low'].iloc[-20:].min()
+        diff = recent_high - recent_low
+        
+        s1_fib = recent_high - 0.382 * diff
+        s2_fib = recent_high - 0.618 * diff
+        r1_fib = recent_low + 0.382 * diff
+        r2_fib = recent_low + 0.618 * diff
+
+        closes = data['Close'].tolist()
+        if not closes:
+            return None
+        mean_price = statistics.mean(closes)
+        std_price = statistics.pstdev(closes)
+        
+        s_std = round(mean_price - 1.5 * std_price, 2)
+        r_std = round(mean_price + 1.5 * std_price, 2)
+        
+        return {
+            "pivot_s1": round(s1_pivot, 2),
+            "pivot_r1": round(r1_pivot, 2),
+            "fib_s1": round(s1_fib, 2),
+            "fib_s2": round(s2_fib, 2),
+            "fib_r1": round(r1_fib, 2),
+            "fib_r2": round(r2_fib, 2),
+            "std_s": s_std,
+            "std_r": r_std
+        }
+    except Exception as e:
+        logger.warning(f"ไม่สามารถคำนวณแนวรับแนวต้าน {symbol}: {e}")
+        return None
+
+# --- Custom Views and Modals ---
+
+class StockView(ui.View):
+    def __init__(self, user_id: int, symbol: str, target_data: dict, is_approaching: bool = False):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.symbol = symbol
+        self.target = target_data.get('target')
+        self.trigger_type = target_data.get('trigger_type', 'below')
+        self.is_approaching = is_approaching
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ คุณไม่สามารถกดปุ่มของคนอื่นได้", ephemeral=True)
+            return False
+        return True
+
+    @ui.button(label="🔄 เช็คราคาใหม่", style=discord.ButtonStyle.primary)
+    async def check_price(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        price = await async_fetch_price(self.symbol)
+        if price is None:
+            await interaction.followup.send(f"❌ ไม่สามารถดึงราคาของ **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+            return
+        
+        status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= self.target else "📉 ต่ำกว่าเป้าหมาย"
+        levels = await async_fetch_technical_levels(self.symbol)
+        
+        embed = discord.Embed(
+            title=f"หุ้น {self.symbol}",
+            color=0x3498db,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+        embed.add_field(name="ราคาเป้าหมาย", value=f"**{self.target}** บาท", inline=True)
+        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if self.trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
+        
+        if levels:
+            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        
+        embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @ui.button(label="✏️ แก้ไขเป้าหมาย", style=discord.ButtonStyle.secondary)
+    async def edit_target(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.send_modal(EditTargetModal(self.user_id, self.symbol))
+
+    @ui.button(label="❌ ลบเป้าหมาย", style=discord.ButtonStyle.danger)
+    async def delete_target(self, interaction: Interaction, button: ui.Button):
+        if self.user_id in user_targets and self.symbol in user_targets[self.user_id]:
+            if (self.user_id, self.symbol) in user_messages:
+                try:
+                    old_msg = user_messages[(self.user_id, self.symbol)]
+                    await old_msg.delete()
+                    del user_messages[(self.user_id, self.symbol)]
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    logger.error(f"Error deleting old message for {self.symbol}: {e}")
+
+            del user_targets[self.user_id][self.symbol]
+            await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{self.symbol}** เรียบร้อยแล้ว", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้", ephemeral=True)
+
+    @ui.button(label="📊 แนวรับ/แนวต้าน", style=discord.ButtonStyle.success)
+    async def support_resistance(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        levels = await async_fetch_technical_levels(self.symbol)
+        
+        if levels is None:
+            await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับแนวต้าน **{self.symbol}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"แนวรับ/แนวต้าน {self.symbol}",
+            color=0x1abc9c,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+        resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+        embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+        embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมายหุ้น"):
+    new_target = ui.TextInput(label="ราคาเป้าหมายใหม่", style=discord.TextStyle.short, placeholder="กรุณาใส่ราคาเป้าหมายเป็นตัวเลข")
+    new_trigger_type = ui.TextInput(label="ประเภทการแจ้งเตือน (below/above)", style=discord.TextStyle.short, default="below")
+    
+    def __init__(self, user_id: int, symbol: str):
+        super().__init__()
+        self.user_id = user_id
+        self.symbol = symbol
+        
+    async def on_submit(self, interaction: Interaction):
+        try:
+            value = float(self.new_target.value)
+        except ValueError:
+            await interaction.response.send_message("❌ กรุณากรอกราคาเป็นตัวเลขที่ถูกต้อง", ephemeral=True)
+            return
+        
+        trigger = self.new_trigger_type.value.lower()
+        if trigger not in ['below', 'above']:
+            await interaction.response.send_message("❌ ประเภทการแจ้งเตือนไม่ถูกต้อง กรุณาใช้ 'below' หรือ 'above'", ephemeral=True)
+            return
             
-            for symbol, data in targets_to_check:
+        if self.user_id not in user_targets:
+            user_targets[self.user_id] = {}
+        
+        user_targets[self.user_id][self.symbol] = {
+            'target': value, 
+            'trigger_type': trigger,
+            'alert_threshold_percent': user_targets[self.user_id].get(self.symbol, {}).get('alert_threshold_percent', 5.0),
+            'approaching_alert_sent': False
+        }
+        
+        await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา {trigger}) เรียบร้อยแล้ว", ephemeral=True)
+
+# --- Bot Class and Commands ---
+class StockBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def on_ready(self):
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("คำสั่ง Slash ถูกซิงค์แบบเซิร์ฟเวอร์")
+            else:
+                await self.tree.sync()
+                logger.info("คำสั่ง Slash ถูกซิงค์แบบ Global")
+        except Exception as e:
+            logger.error(f"ซิงค์คำสั่งล้มเหลว: {e}")
+        
+        self.auto_check.start()
+        logger.info(f"บอท {self.user.name} พร้อมใช้งานแล้ว - ตรวจสอบทุกๆ 5 นาที")
+
+    @tasks.loop(minutes=5)
+    async def auto_check(self):
+        for uid, targets in list(user_targets.items()):
+            for stock, data in list(targets.items()):
                 target = data.get('target')
                 trigger_type = data.get('trigger_type', 'below')
-                # ลบส่วนนี้ออกเพื่อให้แจ้งเตือนซ้ำ: notified = data.get('notified', False)
+                alert_threshold_percent = data.get('alert_threshold_percent', 5.0)
+                approaching_alert_sent = data.get('approaching_alert_sent', False)
                 
-                current_price = fetch_price_blocking(symbol)
-                if current_price is None:
+                price = await async_fetch_price(stock)
+                if price is None:
                     continue
                 
+                # --- Check for approaching target ---
+                should_notify_approaching = False
+                if not approaching_alert_sent:
+                    if trigger_type == 'below':
+                        if target < price <= target * (1 + alert_threshold_percent / 100):
+                            should_notify_approaching = True
+                    elif trigger_type == 'above':
+                        if target > price >= target * (1 - alert_threshold_percent / 100):
+                            should_notify_approaching = True
+
+                if should_notify_approaching:
+                    try:
+                        user = await self.fetch_user(uid)
+                        if user is None: continue
+                        
+                        levels = await async_fetch_technical_levels(stock)
+                        
+                        embed = discord.Embed(
+                            title="🔔 ราคาหุ้นใกล้ถึงเป้าหมายแล้ว!",
+                            description=f"หุ้น **{stock}** กำลังเคลื่อนเข้าใกล้ราคาเป้าหมายของคุณ",
+                            color=0xf39c12,
+                            timestamp=datetime.datetime.now(datetime.timezone.utc)
+                        )
+                        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+                        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+                        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับ' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับ'}", inline=False)
+                        
+                        if levels:
+                            embed.add_field(name="แนวรับ", value=f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท", inline=True)
+                            embed.add_field(name="แนวต้าน", value=f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท", inline=True)
+                        
+                        view = StockView(uid, stock, data, is_approaching=True)
+                        
+                        sent_message = await user.send(embed=embed, view=view)
+
+                        if sent_message:
+                            user_targets[uid][stock]['approaching_alert_sent'] = True
+                            user_messages[(uid, stock)] = sent_message
+
+                    except Exception as e:
+                        logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนราคาใกล้เป้าสำหรับ {stock} ถึง {uid}: {e}")
+
+                # --- Check for target reached ---
                 should_notify = False
-                if (trigger_type == 'below' and current_price <= target) or \
-                   (trigger_type == 'above' and current_price >= target):
+                if trigger_type == 'below' and price <= target:
+                    should_notify = True
+                elif trigger_type == 'above' and price >= target:
                     should_notify = True
                 
                 if should_notify:
-                    message = f"📢 แจ้งเตือนหุ้นถึงเป้าหมาย!\n" \
-                              f"หุ้น: {symbol}\n" \
-                              f"ราคาปัจจุบัน: {current_price} บาท\n" \
-                              f"ราคาเป้าหมาย: {target} บาท"
-                    
                     try:
-                        import asyncio
-                        asyncio.run(send_discord_notification(user_id, message))
-                    except Exception as e:
-                        logger.error(f"Error sending Discord notification: {e}")
-                    
-                    # ลบส่วนนี้ออกเพื่อไม่ให้มีการบันทึกสถานะ notified:
-                    # user_data['targets'][symbol]['notified'] = True
-                    # db.save_data()
-        
-        time.sleep(60) # เปลี่ยนจาก 300 เป็น 60
+                        user = await self.fetch_user(uid)
+                        if user is None: continue
+                        
+                        levels = await async_fetch_technical_levels(stock)
+                        
+                        embed = discord.Embed(
+                            title="📢 แจ้งเตือน: ราคาหุ้นถึงเป้าหมายแล้ว!",
+                            color=0xe67e22,
+                            timestamp=datetime.datetime.now(datetime.timezone.utc)
+                        )
+                        embed.add_field(name="หุ้น", value=f"**{stock}**", inline=True)
+                        embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+                        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+                        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
+                        if levels:
+                            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+                            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+                            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+                            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+                        
+                        view = StockView(uid, stock, data)
+                        
+                        sent_message = await user.send(embed=embed, view=view)
+                        
+                        if sent_message:
+                            if uid in user_targets and stock in user_targets[uid]:
+                                del user_targets[uid][stock]
+                            
+                            if (uid, stock) in user_messages:
+                                del user_messages[(uid, stock)]
 
-# --- Main Entry Point ---
-if __name__ == "__main__":
-    # Start the stock checker in a separate thread
-    Thread(target=run_stock_checker, daemon=True).start()
+                    except Exception as e:
+                        logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
+
+# --- Slash Command Group ---
+stock_group = app_commands.Group(name="หุ้น", description="คำสั่งสำหรับจัดการข้อมูลหุ้น")
+
+@stock_group.command(name="ตั้ง", description="ตั้งเป้าหมายราคาหุ้น")
+@app_commands.describe(
+    stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK",
+    target="ราคาเป้าหมาย",
+    trigger_type="ประเภทการแจ้งเตือน ('below' หรือ 'above', ค่าเริ่มต้นคือ below)",
+    alert_threshold_percent="เปอร์เซ็นต์ที่ต้องการให้แจ้งเตือนเมื่อราคาเข้าใกล้เป้าหมาย (ค่าเริ่มต้น 5%)"
+)
+@app_commands.choices(
+    trigger_type=[
+        app_commands.Choice(name="ต่ำกว่าหรือเท่ากับเป้าหมาย", value="below"),
+        app_commands.Choice(name="สูงกว่าหรือเท่ากับเป้าหมาย", value="above")
+    ]
+)
+async def set_target_cmd(interaction: Interaction, stock: str, target: float, trigger_type: str = 'below', alert_threshold_percent: float = 5.0):
+    uid = interaction.user.id
+    stock = stock.upper()
     
-    # Run the web server
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    if alert_threshold_percent < 0 or alert_threshold_percent > 100:
+        await interaction.response.send_message("❌ เปอร์เซ็นต์การแจ้งเตือนต้องอยู่ระหว่าง 0 ถึง 100", ephemeral=True)
+        return
+        
+    price = await async_fetch_price(stock)
+    if price is None:
+        await interaction.response.send_message(f"❌ ไม่พบหุ้นชื่อ **{stock}** หรือข้อมูลไม่ถูกต้อง กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+        return
+
+    if uid not in user_targets:
+        user_targets[uid] = {}
+
+    user_targets[uid][stock] = {
+        'target': target, 
+        'trigger_type': trigger_type,
+        'alert_threshold_percent': alert_threshold_percent,
+        'approaching_alert_sent': False
+    }
+    
+    embed = discord.Embed(
+        title="✅ ตั้งเป้าหมายสำเร็จ",
+        description=f"{interaction.user.mention} ตั้งเป้าหมายหุ้น **{stock}**",
+        color=0x2ecc71,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+    embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=True)
+    embed.add_field(name="แจ้งเตือนใกล้เป้าหมาย", value=f"**{alert_threshold_percent}%**", inline=False)
+    embed.add_field(name="ช่องทางแจ้งเตือน", value=f"**ข้อความส่วนตัว (DM)**", inline=False)
+
+    view = StockView(uid, stock, user_targets[uid][stock])
+    await interaction.response.send_message(embed=embed, view=view)
+
+@stock_group.command(name="ราคา", description="เช็คราคาหุ้นปัจจุบัน")
+@app_commands.describe(stock="ชื่อหุ้น เช่น AAPL หรือ PTT.BK")
+async def check_stock_cmd(interaction: Interaction, stock: str):
+    await interaction.response.defer(ephemeral=True)
+    stock = stock.upper()
+    price = await async_fetch_price(stock)
+    
+    if price is None:
+        await interaction.followup.send(f"❌ ไม่สามารถดึงราคาหุ้น **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+        return
+    
+    uid = interaction.user.id
+    target_data = user_targets.get(uid, {}).get(stock)
+    
+    embed = discord.Embed(
+        title=f"ข้อมูลหุ้น {stock}",
+        color=0x3498db,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="ราคาปัจจุบัน", value=f"**{price}** บาท", inline=True)
+    
+    if target_data:
+        target = target_data['target']
+        trigger_type = target_data['trigger_type']
+        
+        status = "📈 สูงกว่าหรือเท่ากับเป้าหมาย" if price >= target else "📉 ต่ำกว่าเป้าหมาย"
+        levels = await async_fetch_technical_levels(stock)
+        
+        embed.add_field(name="ราคาเป้าหมาย", value=f"**{target}** บาท", inline=True)
+        embed.add_field(name="ประเภทการแจ้งเตือน", value=f"{'เมื่อราคาต่ำกว่า/เท่ากับเป้าหมาย' if trigger_type == 'below' else 'เมื่อราคาสูงกว่า/เท่ากับเป้าหมาย'}", inline=False)
+        
+        if levels:
+            support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+            resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+            embed.add_field(name="แนวรับ", value=support_levels, inline=False)
+            embed.add_field(name="แนวต้าน", value=resistance_levels, inline=False)
+        embed.set_footer(text=f"{status} | ข้อมูลจาก yfinance")
+        view = StockView(uid, stock, target_data)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        embed.description = f"**ราคา: {price} บาท**\n(คุณยังไม่ได้ตั้งเป้าหมายสำหรับหุ้นนี้)"
+        embed.color = 0x95a5a6
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@stock_group.command(name="รายการ", description="ดูเป้าหมายที่คุณตั้งไว้ทั้งหมด")
+async def show_targets_cmd(interaction: Interaction):
+    uid = interaction.user.id
+    targets = user_targets.get(uid, {})
+    if not targets:
+        await interaction.response.send_message("❌ คุณยังไม่ได้ตั้งเป้าหมายหุ้นใด ๆ", ephemeral=True)
+        return
+        
+    embed = discord.Embed(
+        title="📊 เป้าหมายหุ้นของคุณ",
+        description="นี่คือรายการเป้าหมายหุ้นที่คุณตั้งไว้:",
+        color=0x3498db
+    )
+    for s, data in targets.items():
+        trigger_text = 'ต่ำกว่าหรือเท่ากับ' if data['trigger_type'] == 'below' else 'สูงกว่าหรือเท่ากับ'
+        embed.add_field(name=f"หุ้น {s}", value=f"ราคาเป้าหมาย: **{data['target']}** บาท\nแจ้งเตือนเมื่อราคา {trigger_text} เป้าหมาย\nแจ้งเตือนใกล้เป้า: **{data['alert_threshold_percent']}%**\nช่องทาง: **ข้อความส่วนตัว (DM)**", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@stock_group.command(name="ลบ", description="ลบเป้าหมายหุ้น")
+@app_commands.describe(stock="ชื่อหุ้นที่จะลบ")
+async def delete_target_cmd(interaction: Interaction, stock: str):
+    uid = interaction.user.id
+    stock = stock.upper()
+    
+    if uid in user_targets and stock in user_targets[uid]:
+        if (uid, stock) in user_messages:
+            try:
+                old_msg = user_messages[(uid, stock)]
+                await old_msg.delete()
+                del user_messages[(uid, stock)]
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                logger.error(f"เกิดข้อผิดพลาดในการลบข้อความแจ้งเตือนเก่าสำหรับ {stock}: {e}")
+        
+        del user_targets[uid][stock]
+        await interaction.response.send_message(f"🗑️ ลบเป้าหมายหุ้น **{stock}** เรียบร้อยแล้ว", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ ไม่พบเป้าหมายที่คุณตั้งไว้สำหรับหุ้นนี้", ephemeral=True)
+
+@stock_group.command(name="แนวรับแนวต้าน", description="ดูแนวรับและแนวต้านของหุ้น (หลายมุมมอง)")
+@app_commands.describe(stock="ชื่อหุ้นที่จะดูข้อมูล")
+async def levels_cmd(interaction: Interaction, stock: str):
+    await interaction.response.defer(ephemeral=True)
+    stock = stock.upper()
+    levels = await async_fetch_technical_levels(stock)
+    
+    if levels is None:
+        await interaction.followup.send(f"❌ ไม่สามารถคำนวณแนวรับ/แนวต้าน **{stock}** ได้ กรุณาตรวจสอบชื่อหุ้นอีกครั้ง", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"แนวรับและแนวต้าน **{stock}** (หลายมุมมอง)",
+        color=0x1abc9c,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    
+    support_levels = f"**Pivot:** {levels['pivot_s1']} บาท\n**Fibonacci:** {levels['fib_s1']} / {levels['fib_s2']} บาท\n**ค่าเฉลี่ย:** {levels['std_s']} บาท"
+    resistance_levels = f"**Pivot:** {levels['pivot_r1']} บาท\n**Fibonacci:** {levels['fib_r1']} / {levels['fib_r2']} บาท\n**ค่าเฉลี่ย:** {levels['std_r']} บาท"
+    
+    embed.add_field(name="แนวรับ 📉", value=support_levels, inline=False)
+    embed.add_field(name="แนวต้าน 📈", value=resistance_levels, inline=False)
+    
+    embed.set_footer(text="คำนวณจากข้อมูลย้อนหลัง 3 เดือน")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("❌ กรุณาตั้งค่า DISCORD_TOKEN ใน Secrets/Environment Variables")
+    else:
+        bot = StockBot()
+        bot.tree.add_command(stock_group)
+        bot.run(DISCORD_TOKEN)
