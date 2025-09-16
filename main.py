@@ -330,20 +330,19 @@ class StockBot(commands.Bot):
 
     @tasks.loop(seconds=60)
     async def auto_check(self):
-        current_minute = datetime.datetime.now().minute
-        
-        # Check for VIP1 users every minute
+        now = datetime.datetime.now()
+        current_minute = now.minute
+
         for uid, targets in list(user_targets.items()):
-            user_role = user_roles.get(str(uid))
+            user_role = user_roles.get(str(uid), 'regular')
+
             if user_role == 'VIP1':
+                # VIP1 users get checked every minute
                 await self.run_user_check(uid, targets)
-        
-        # Check for regular users every 5 minutes
-        if current_minute % 5 == 0:
-            for uid, targets in list(user_targets.items()):
-                user_role = user_roles.get(str(uid))
-                if user_role != 'VIP1':
-                    await self.run_user_check(uid, targets)
+            elif current_minute % 5 == 0:
+                # Regular users get checked every 5 minutes (on minutes 0, 5, 10, etc.)
+                await self.run_user_check(uid, targets)
+
 
     async def run_user_check(self, uid, targets):
         for stock, data in list(targets.items()):
