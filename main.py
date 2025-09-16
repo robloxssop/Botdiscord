@@ -299,8 +299,7 @@ class EditTargetModal(ui.Modal, title="แก้ไขเป้าหมาย�
         user_targets[self.user_id][self.symbol] = {
             'target': value,
             'trigger_type': trigger,
-            'alert_threshold_percent': user_targets[self.user_id].get(self.symbol, {}).get('alert_threshold_percent', 5.0),
-            'approaching_alert_sent': False
+            'alert_threshold_percent': user_targets[self.user_id].get(self.symbol, {}).get('alert_threshold_percent', 5.0)
         }
         
         await interaction.response.send_message(f"✅ ตั้งเป้าหมายใหม่สำหรับ **{self.symbol}** ที่ **{value}** บาท (แจ้งเตือนเมื่อราคา{self.new_trigger_type.value}) เรียบร้อยแล้ว", ephemeral=True)
@@ -337,14 +336,11 @@ class StockBot(commands.Bot):
             user_role = user_roles.get(str(uid), 'regular')
 
             if user_role == 'VIP1':
-                # VIP1 users get checked every minute
-                await self.run_user_check(uid, targets)
+                await self.run_user_check(uid, targets, check_interval=1)
             elif current_minute % 5 == 0:
-                # Regular users get checked every 5 minutes (on minutes 0, 5, 10, etc.)
-                await self.run_user_check(uid, targets)
+                await self.run_user_check(uid, targets, check_interval=5)
 
-
-    async def run_user_check(self, uid, targets):
+    async def run_user_check(self, uid, targets, check_interval):
         for stock, data in list(targets.items()):
             target = data.get('target')
             trigger_type = data.get('trigger_type', 'below')
@@ -355,15 +351,13 @@ class StockBot(commands.Bot):
                 continue
             
             # --- Check for approaching target ---
-            approaching_alert_sent = data.get('approaching_alert_sent', False)
             should_notify_approaching = False
-            if not approaching_alert_sent:
-                if trigger_type == 'below':
-                    if target < price <= target * (1 + alert_threshold_percent / 100):
-                        should_notify_approaching = True
-                elif trigger_type == 'above':
-                    if target > price >= target * (1 - alert_threshold_percent / 100):
-                        should_notify_approaching = True
+            if trigger_type == 'below':
+                if target < price <= target * (1 + alert_threshold_percent / 100):
+                    should_notify_approaching = True
+            elif trigger_type == 'above':
+                if target > price >= target * (1 - alert_threshold_percent / 100):
+                    should_notify_approaching = True
             
             if should_notify_approaching:
                 try:
@@ -387,10 +381,7 @@ class StockBot(commands.Bot):
                         embed.add_field(name="Point of Control (POC)", value=f"**{levels.get('poc', 'N/A')}** บาท", inline=False)
 
                     view = StockView(uid, stock, data, is_approaching=True)
-                    sent_message = await user.send(embed=embed, view=view)
-                    if sent_message:
-                        user_targets[uid][stock]['approaching_alert_sent'] = True
-                        user_messages[(uid, stock)] = sent_message
+                    await user.send(embed=embed, view=view)
                         
                 except Exception as e:
                     logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนราคาใกล้เป้าสำหรับ {stock} ถึง {uid}: {e}")
@@ -424,9 +415,7 @@ class StockBot(commands.Bot):
                         embed.add_field(name="Point of Control (POC)", value=f"**{levels.get('poc', 'N/A')}** บาท", inline=False)
 
                     view = StockView(uid, stock, data)
-                    sent_message = await user.send(embed=embed, view=view)
-                    if sent_message:
-                        pass
+                    await user.send(embed=embed, view=view)
                 except Exception as e:
                     logger.error(f"เกิดข้อผิดพลาดในการส่งแจ้งเตือนสำหรับ {stock} ถึง {uid}: {e}")
 
@@ -465,8 +454,7 @@ async def set_target_cmd(interaction: Interaction, หุ้น: str, ราค�
     user_targets[uid][stock] = {
         'target': ราคาเป้าหมาย,
         'trigger_type': เงื่อนไข,
-        'alert_threshold_percent': แจ้งเตือนล่วงหน้า,
-        'approaching_alert_sent': False
+        'alert_threshold_percent': แจ้งเตือนล่วงหน้า
     }
 
     trigger_text_map = {'below': 'ราคาต่ำกว่าหรือเท่ากับเป้าหมาย', 'above': 'ราคาสูงกว่าหรือเท่ากับเป้าหมาย'}
