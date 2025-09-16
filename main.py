@@ -334,13 +334,15 @@ class StockBot(commands.Bot):
 
         for uid, targets in list(user_targets.items()):
             user_role = user_roles.get(str(uid), 'regular')
-
+            
+            # Check for VIP1 users every minute
             if user_role == 'VIP1':
-                await self.run_user_check(uid, targets, check_interval=1)
+                await self.run_user_check(uid, targets)
+            # Check for regular users every 5 minutes
             elif current_minute % 5 == 0:
-                await self.run_user_check(uid, targets, check_interval=5)
+                await self.run_user_check(uid, targets)
 
-    async def run_user_check(self, uid, targets, check_interval):
+    async def run_user_check(self, uid, targets):
         for stock, data in list(targets.items()):
             target = data.get('target')
             trigger_type = data.get('trigger_type', 'below')
@@ -630,3 +632,4 @@ if __name__ == "__main__":
         bot = StockBot()
         bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
+
