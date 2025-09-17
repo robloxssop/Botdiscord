@@ -27,7 +27,7 @@ user_messages = {}
 # For demonstration, a mock user role system. In a real app, this would be from a database.
 user_roles = {
     # Replace with a real user ID from your guild to test VIP features
-    # 'YOUR_VIP_USER_ID': 'VIP1'
+    # Example: '123456789012345678': 'VIP1'
 }
 
 # --- Asynchronous Wrappers for Blocking I/O ---
@@ -338,9 +338,11 @@ class StockBot(commands.Bot):
             # Check for VIP1 users every minute
             if user_role == 'VIP1':
                 await self.run_user_check(uid, targets)
+                logger.info(f"Checking VIP user {uid} at {now.strftime('%H:%M:%S')}")
             # Check for regular users every 5 minutes
             elif current_minute % 5 == 0:
                 await self.run_user_check(uid, targets)
+                logger.info(f"Checking regular user {uid} at {now.strftime('%H:%M:%S')}")
 
     async def run_user_check(self, uid, targets):
         for stock, data in list(targets.items()):
@@ -632,4 +634,3 @@ if __name__ == "__main__":
         bot = StockBot()
         bot.tree.add_command(stock_group)
         bot.run(DISCORD_TOKEN)
-
